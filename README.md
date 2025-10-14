@@ -5,6 +5,8 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
+![Example image](https://github.com/LennardKrause/ReciprocalPlayground/blob/main/example.jpg)
+
 >[!WARNING]
 >This comes with plenty of bugs!
 
