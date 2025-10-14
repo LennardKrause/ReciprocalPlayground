@@ -1,0 +1,2 @@
+# ReciprocalPlayground
+Explore reciprocal space
