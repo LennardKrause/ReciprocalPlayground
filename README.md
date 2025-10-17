@@ -6,7 +6,7 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
-![Example image](https://github.com/LennardKrause/ReciprocalPlayground/blob/main/example.jpg)
+![Example image](https://github.com/LennardKrause/ReciprocalPlayground/blob/main/example.png)
 
 Update:
  - Calculation of symmetry equivalent reflections (and completeness) unified and fixed.
