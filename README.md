@@ -11,8 +11,7 @@
 Update:
  - Calculation of symmetry equivalent reflections (and completeness) unified and fixed.
  - Detector parameters adjustable via GUI.
- - Hotkeys! Use F1-F2-F3 to look down the cell axes a-b-c
- - Use F4-F5-F6 to look down on Omega, Chi and Phi.
+ - Hotkeys! Use F1-F2-F3 to look down the cell axes a-b-c, F4-F5-F6 to look down on Omega, Chi and Phi.
 
 >[!WARNING]
 >This comes with plenty of bugs!
