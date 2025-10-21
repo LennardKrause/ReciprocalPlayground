@@ -24,6 +24,10 @@ def signed_angle(v1: np.ndarray, v2: np.ndarray, up_reference: np.ndarray) -> fl
         return np.arctan2(np.linalg.norm(cross), dotprod) * sign
 
 class Quaternion:
+    """
+    Copyright (C) 2025 Karl O. R. Juul (kjuul@chem.au.dk) - All Rights Reserved
+    This code is part of a larger project that will be published soon.
+    """
     __author__ = "Karl O. R. Juul (kjuul@chem.au.dk)"
     # Good resource: https://danceswithcode.net/engineeringnotes/quaternions/quaternions.html
     def __init__(self, w, x, y, z) -> None:
