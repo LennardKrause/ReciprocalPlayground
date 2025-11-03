@@ -5,7 +5,8 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
-## Version 0.0.4 (31.10.2025)
+## Version 0.0.5 (03.11.2025)
+ - FIXED: Wrong resolution cut-off applied to hkl generation.
  - Added more SFX options (parameterised partiality correction, of some kind!).
  - Calculation of symmetry equivalent reflections (and completeness) unified and fixed.
  - Detector parameters adjustable via GUI.
