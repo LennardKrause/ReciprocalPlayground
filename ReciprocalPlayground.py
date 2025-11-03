@@ -18,7 +18,7 @@ pg.setConfigOptions(antialias=True)
 # detector rotation is off upon resetting the crystal
 # Add show parcor toggle button to sfx gui
 
-__version__ = 'v0.0.4, 31.10.2025'
+__version__ = 'v0.0.5, 03.11.2025'
 
 def signed_angle(v1: np.ndarray, v2: np.ndarray, up_reference: np.ndarray) -> float:
         cross = np.cross(v1, v2)
