@@ -307,7 +307,7 @@ def calc_hkls(A, res):
     hkl[:,1] = ks.reshape((-1))
     hkl[:,2] = ls.reshape((-1))
     # remove high resolution hkls
-    hkl = hkl[(np.linalg.norm(hkl @ A, axis=1) <= q_cutoff)]
+    hkl = hkl[(np.linalg.norm(hkl @ A.T, axis=1) <= q_cutoff)]
     hkl = np.delete(hkl, len(hkl)//2, 0)
     return hkl
 
