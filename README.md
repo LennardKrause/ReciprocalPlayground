@@ -5,7 +5,10 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
-## Version 0.0.5 (03.11.2025)
+## Version 0.0.6 (04.11.2025)
+ - Added a simple data collection strategy table.
+ - Added a crystal at the ewald center (it's there, you can't get rid of it yet!).
+ - Added a placeholder detector screen.
  - FIXED: Wrong resolution cut-off applied to hkl generation.
  - Added more SFX options (parameterised partiality correction, of some kind!).
  - Calculation of symmetry equivalent reflections (and completeness) unified and fixed.
