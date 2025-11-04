@@ -7,18 +7,19 @@ import pandas as pd
 import sympy
 import re
 pg.setConfigOptions(antialias=True)
-#pd.options.display.max_rows = 999
 
 # ideas
 # front culling of ewald sphere and reciprocal lattice points
 # add detector axes, poni, distance (modules?)
+# read h5 files from sfx experiments
+#  - simulate sfx patterns from given hkls and crystal orientation distribution
+#  - implement rocking curve simulation (partiality)
 
 # todo
 # gui toggles behave erratically
-# detector rotation is off upon resetting the crystal
-# Add show parcor toggle button to sfx gui
+# add strategy calculation / optimization
 
-__version__ = 'v0.0.5, 03.11.2025'
+__version__ = 'v0.0.6, 04.11.2025'
 
 def signed_angle(v1: np.ndarray, v2: np.ndarray, up_reference: np.ndarray) -> float:
         cross = np.cross(v1, v2)
@@ -392,6 +393,7 @@ def overlap_nd(mu1, mu2, s1, s2, dim=None):
 
 class Visualizer(QtWidgets.QMainWindow):
     sigKeyPress = QtCore.pyqtSignal(object)
+    sigScanFinished = QtCore.pyqtSignal()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -401,20 +403,19 @@ class Visualizer(QtWidgets.QMainWindow):
         self.setCentralWidget(central_widget)
         self.sigKeyPress.connect(self.keyPressEvent)
 
-        parameter_scroll = QtWidgets.QScrollArea()
-        parameter_scroll.setContentsMargins(0,0,0,0)
-        #parameter_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        #parameter_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        parameter_scroll.setWidgetResizable(True)
-        central_widget.addWidget(parameter_scroll)
+        self.parameter_scroll = QtWidgets.QScrollArea()
+        self.parameter_scroll.setContentsMargins(0,0,0,0)
+        #self.parameter_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        #self.parameter_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.parameter_scroll.setWidgetResizable(True)
+        central_widget.addWidget(self.parameter_scroll)
         self.parameter_box = QtWidgets.QFrame()
-        self.parameter_box.setContentsMargins(0,0,0,0)
         self.params_layout = QtWidgets.QVBoxLayout()
-        self.params_layout.setSpacing(5)
-        self.params_layout.setContentsMargins(0,0,0,0)
+        self.params_layout.setSpacing(0)
+        self.params_layout.setContentsMargins(10,0,0,0)
         self.params_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self.parameter_box.setLayout(self.params_layout)
-        parameter_scroll.setWidget(self.parameter_box)
+        self.parameter_scroll.setWidget(self.parameter_box)
 
         self.gl3d = gl.GLViewWidget()
         self.gl3d.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
@@ -444,8 +445,8 @@ class Visualizer(QtWidgets.QMainWindow):
         self.sfx_keep_all_data = False
         self.show_sfx_parcor = False
 
-        self.setGeometry(0, 0, 1920, 1080)
-        #self.setGeometry(0, 0, 1280, 768)
+        #self.setGeometry(0, 0, 1920, 1080)
+        self.setGeometry(500, 0, 1280, 768)
         self.plot_fnt_tab = QtGui.QFont('Helvetica', 14)
         self.plot_fnt_lbl = QtGui.QFont('Helvetica', 18)
         self.plot_fnt_hkl = QtGui.QFont('Helvetica', 20)
@@ -462,26 +463,27 @@ class Visualizer(QtWidgets.QMainWindow):
         self.color_scat_vecs = QtGui.QColor(245, 173, 24, 200)
         self.color_diff_vecs = QtGui.QColor(255, 0, 96, 200)
         self.color_detector = QtGui.QColor(128, 128, 128, 128)
-        self.color_scat_patt = QtGui.QColor(255, 0, 96, 200)
+        self.color_scat_patt = QtGui.QColor(200, 200, 200, 200)
         self.color_gui_buttons = QtGui.QColor(0, 106, 103, 255)
 
-        self.par = {'sample_cell_a':6,
-                    'sample_cell_b':6,
-                    'sample_cell_c':6,
-                    'sample_cell_alpha':90,
-                    'sample_cell_beta':90,
-                    'sample_cell_gamma':90,
+        # Default parameters
+        self.par = {'sample_cell_a':6.0,
+                    'sample_cell_b':7.0,
+                    'sample_cell_c':8.0,
+                    'sample_cell_alpha':90.0,
+                    'sample_cell_beta':90.0,
+                    'sample_cell_gamma':90.0,
                     'sample_point_group':'-1',
                     'sample_orientation':None, # None for random
-                    'det_poni_x':None,
-                    'det_poni_y':None,
+                    'det_poni_1':None,
+                    'det_poni_2':None,
                     'det_distance':0.152,
                     'det_pix_s':75.0E-6,
-                    'det_pix_x':2068,
-                    'det_pix_y':2162,
+                    'det_pix_1':2068,
+                    'det_pix_2':2162,
                     'wavelength':0.59040E-10,# 21.0 keV
                     #'wavelength':0.56356E-10,# 22.0 keV"
-                    'ewald_offset':0.01,
+                    'ewald_offset':0.005,
                     'max_resolution':None,
                     'scan_axis':'Omega',
                     'scan_step':0.10,
@@ -500,7 +502,16 @@ class Visualizer(QtWidgets.QMainWindow):
                     'sfx_spectral_width':None,
                     'sfx_rlp_size':None,}
 
+        # Data collection strategy
+        #  - omg, chi, phi, width, range
+        self.dc_strat = [(  0,   0,   0, 0.5, 180),
+                         (  0,  24,   0, 0.5, 180),
+                         (  0,  48,   0, 0.5, 180),
+                         (  0,  48, 120, 0.5, 180),
+                         (  0,  48, 240, 0.5, 180)]
+
         # Set camera
+        #self.gl3d.setCameraParams(distance=75000, fov=60, elevation=-45, azimuth=0)
         self.gl3d.setCameraParams(distance=75000, fov=60, elevation=-45, azimuth=0)
         self.gui_set_projection(toggle=self.orth_proj)
         # Set plot detector distance
@@ -508,17 +519,31 @@ class Visualizer(QtWidgets.QMainWindow):
         # Scattering pattern is misaligned and reaches
         # out further than the detector
         self.plot_det_dist = 100
+        self.look_along_option = 1
+
         if self.par['max_resolution'] is None:
             self.par['max_resolution'] = self.par['wavelength'] / 2
+            
         # Set default poni to center of detector if None
-        if self.par['det_poni_x'] is None:
-            self.par['det_poni_x'] = self.par['det_pix_x'] * self.par['det_pix_s'] / 2
-        if self.par['det_poni_y'] is None:
-            self.par['det_poni_y'] = self.par['det_pix_y'] * self.par['det_pix_s'] / 2
+        if self.par['det_poni_1'] is None:
+            self.par['det_poni_1'] = self.par['det_pix_1'] * self.par['det_pix_s'] / 2
+        if self.par['det_poni_2'] is None:
+            self.par['det_poni_2'] = self.par['det_pix_2'] * self.par['det_pix_s'] / 2
         if self.par['sfx_spectral_width'] is None:
             self.par['sfx_spectral_width'] = 2 * self.par['ewald_offset']
         if self.par['sfx_rlp_size'] is None:
             self.par['sfx_rlp_size'] = 2 * self.par['ewald_offset']
+
+        # Placeholder detector image
+        self.det_img_data = self.gui_detector_image(shape=(self.par['det_pix_1'],
+                                                           self.par['det_pix_2']),
+                                                    background_level=0.0,
+                                                    noise_sigma=1.0,
+                                                    gauss_amp=50.0,
+                                                    gauss_sigma=250.0,
+                                                    gauss_center=(self.par['det_poni_1']/self.par['det_pix_s'],
+                                                                  self.par['det_poni_2']/self.par['det_pix_s']),
+                                                    seed=42)
 
         # Get initial orientation matrix
         self.get_orientation_matrix(self.par['sample_orientation'])
@@ -580,9 +605,6 @@ class Visualizer(QtWidgets.QMainWindow):
         self.init_gui_parameters()
         self.init_plot()
 
-        # Set minimum width of parameter scroll area to fit all unfolded parameters
-        parameter_scroll.setMinimumWidth(self.parameter_box.sizeHint().width() + 20)
-
         # Initial toggle states
         self.gui_toggle_hkls(self.show_text_hkls)
 
@@ -597,9 +619,11 @@ class Visualizer(QtWidgets.QMainWindow):
         btn.clicked.connect(lambda: box.setVisible(not btn.isChecked()))
         box = QtWidgets.QGroupBox()
         box_layout = QtWidgets.QFormLayout()
+        box_layout.setContentsMargins(5, 0, 5, 5)
         box.setLayout(box_layout)
         self.params_layout.addWidget(btn)
         self.params_layout.addWidget(box)
+        self.params_layout.addSpacing(5)
         return box_layout
 
     def init_gui(self):
@@ -765,20 +789,20 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_det_distance.setSuffix(' mm')
         self.gui_det_distance.valueChanged.connect(self.gui_update_detector)
         self.box_det_layout.addRow(QtWidgets.QLabel("Distance"), self.gui_det_distance)
-        self.gui_det_dim_1 = pg.QtWidgets.QSpinBox()
-        self.gui_det_dim_1.setMinimum(1)
-        self.gui_det_dim_1.setMaximum(10000)
-        self.gui_det_dim_1.setValue(self.par['det_pix_x'])
-        self.gui_det_dim_1.setSuffix(' px')
-        self.gui_det_dim_1.valueChanged.connect(self.gui_update_detector)
-        self.box_det_layout.addRow(QtWidgets.QLabel("Size x"), self.gui_det_dim_1)
         self.gui_det_dim_2 = pg.QtWidgets.QSpinBox()
         self.gui_det_dim_2.setMinimum(1)
         self.gui_det_dim_2.setMaximum(10000)
-        self.gui_det_dim_2.setValue(self.par['det_pix_y'])
+        self.gui_det_dim_2.setValue(self.par['det_pix_2'])
         self.gui_det_dim_2.setSuffix(' px')
         self.gui_det_dim_2.valueChanged.connect(self.gui_update_detector)
-        self.box_det_layout.addRow(QtWidgets.QLabel("Size y"), self.gui_det_dim_2)
+        self.box_det_layout.addRow(QtWidgets.QLabel("Size x"), self.gui_det_dim_2)
+        self.gui_det_dim_1 = pg.QtWidgets.QSpinBox()
+        self.gui_det_dim_1.setMinimum(1)
+        self.gui_det_dim_1.setMaximum(10000)
+        self.gui_det_dim_1.setValue(self.par['det_pix_1'])
+        self.gui_det_dim_1.setSuffix(' px')
+        self.gui_det_dim_1.valueChanged.connect(self.gui_update_detector)
+        self.box_det_layout.addRow(QtWidgets.QLabel("Size y"), self.gui_det_dim_1)
         self.gui_det_pix_size = pg.QtWidgets.QDoubleSpinBox()
         self.gui_det_pix_size.setMinimum(0.01)
         self.gui_det_pix_size.setMaximum(10000)
@@ -881,6 +905,35 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_start_scan.clicked.connect(self.scan_toggle)
         self.box_scan_layout.addRow(self.gui_start_scan)
 
+        # Data collection strategy
+        self.box_strat_layout = self.add_dock_widget("Data Collection Strategy")
+        self.gui_strat_tab = QtWidgets.QTableWidget()
+        self.gui_strat_tab.setColumnCount(5)
+        self.gui_strat_tab.setHorizontalHeaderLabels(['Omega', 'Chi', 'Phi', 'Width', 'Range'])
+        self.gui_strat_tab.setAlternatingRowColors(True)
+        self.gui_strat_tab.setSortingEnabled(True)
+        self.gui_strat_tab.setFont(self.plot_fnt_tab)
+        #self.gui_strat_tab.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
+        self.gui_strat_tab.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.gui_strat_tab.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        #self.gui_strat_tab.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.gui_strat_tab.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        #self.gui_strat_tab.verticalHeader().sectionClicked.connect(print)
+        self.gui_strat_tab.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        self.box_strat_layout.addRow(self.gui_strat_tab)
+        for row in self.dc_strat:
+            row_pos = self.gui_strat_tab.rowCount()
+            self.gui_strat_tab.insertRow(row_pos)
+            for col in range(5):
+                item = QtWidgets.QTableWidgetItem(str(row[col]))
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.gui_strat_tab.setItem(row_pos, col, item)
+
+        self.gui_strat_scan = QtWidgets.QPushButton('Run Strategy')
+        self.gui_strat_scan.setStyleSheet(f"background-color: {self.color_gui_buttons.name()}")
+        self.gui_strat_scan.clicked.connect(self.strat_toggle)
+        self.box_strat_layout.addRow(self.gui_strat_scan)
+
         # SFX parameters
         self.box_sfx_layout = self.add_dock_widget("SFX Parameters")
         self.gui_show_sfx_parcor = QtWidgets.QCheckBox()
@@ -940,6 +993,9 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_dat_tab.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.box_dat_layout.addRow(self.gui_dat_tab)
 
+        # Set minimum width of parameter scroll area to fit all unfolded parameters
+        self.parameter_scroll.setMinimumWidth(self.parameter_box.sizeHint().width() + 20)
+
     def init_gui_parameters(self):
         # Update parameters from GUI
         self.par['sample_cell_a'] = self.gui_sample_a.value()
@@ -991,6 +1047,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.par['gon_chi_ang'] = 0.0
         self.par['gon_omg_ang'] = 0.0
         self.par['gon_tth_ang'] = 0.0
+        self.rotate_gon_tth(relative=False)
 
     def init_plot(self):
         #################
@@ -1036,16 +1093,16 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gl3d.addItem(self.plot_ax_c_lbl)
         # create the unit cell
         verts = np.array([[ 0, 0, 0],
-                            axs_a, axs_b, axs_c,
-                            axs_a + axs_b,
-                            axs_a + axs_c,
-                            axs_b + axs_c,
-                            axs_a + axs_b + axs_c], dtype=float)
+                           axs_a, axs_b, axs_c,
+                           axs_a + axs_b,
+                           axs_a + axs_c,
+                           axs_b + axs_c,
+                           axs_a + axs_b + axs_c], dtype=float)
         edges = np.array([[0,1],[0,2],[0,3],
-                            [1,4],[2,4],
-                            [1,5],[3,5],
-                            [2,6],[3,6],
-                            [7,4],[7,5],[7,6]], dtype=int)
+                          [1,4],[2,4],
+                          [1,5],[3,5],
+                          [2,6],[3,6],
+                          [7,4],[7,5],[7,6]], dtype=int)
         self.plot_cell = gl.GLGraphItem()
         self.plot_cell.setData(edges=edges, nodePositions=verts,
                                 edgeColor=QtGui.QColor("#FFFFFFAA"), edgeWidth=1)
@@ -1165,6 +1222,98 @@ class Visualizer(QtWidgets.QMainWindow):
         self.ewald_outline_ac.translate(0, -self.ewald_rad, -self.ewald_rad)
         self.gl3d.addItem(self.ewald_outline_ac)
 
+        ##################
+        # Create crystal #
+        ##################
+        """
+        # Build a transparent crystal mesh from the sample unit cell parameters and
+        # highlight its outline. Use the rotated cell axes (cell_axs) defined above.
+        # cell_axs already computed above as self.OM_UC * 1E-10
+        inv_cell_axs = np.linalg.inv(cell_axs.T)
+        axs_a = inv_cell_axs[:, 0]
+        axs_b = inv_cell_axs[:, 1]
+        axs_c = inv_cell_axs[:, 2]
+        # 8 corners of the unit cell
+        verts_cell = np.vstack([
+            np.zeros(3),
+            axs_a,
+            axs_b,
+            axs_c,
+            axs_a + axs_b,
+            axs_a + axs_c,
+            axs_b + axs_c,
+            axs_a + axs_b + axs_c,
+        ])
+        # center geometry around its centroid
+        centroid = verts_cell.mean(axis=0)
+        verts_centered = verts_cell - centroid
+        # scale to fit nicely inside Ewald sphere (fraction of radius)
+        max_len = np.max(np.linalg.norm(verts_centered, axis=1))
+        target = max(self.ewald_rad * 0.1, 1e-6)
+        scale = target / max_len if max_len > 0 else 1.0
+        verts_scaled = (verts_centered * scale).astype(np.float32)
+
+        # use only 6 triangular faces (one triangle per parallelepiped face) to reduce face count
+        faces_cell = np.array([
+            # bottom (0,1,4,2)
+            [0, 1, 4], [0, 4, 2],
+            # top    (3,5,7,6)
+            [3, 5, 7], [3, 7, 6],
+            # front  (0,1,5,3)
+            [0, 1, 5], [0, 5, 3],
+            # back   (2,4,7,6)
+            [2, 4, 7], [2, 7, 6],
+            # left   (0,2,6,3)
+            [0, 2, 6], [0, 6, 3],
+            # right  (1,4,7,5)
+            [1, 4, 7], [1, 7, 5],
+        ], dtype=np.int32)
+
+        # transparent face colors (slightly bluish)
+        face_color = np.array([0.65, 0.75, 1.0, 0.25], dtype=np.float32)
+        face_colors = np.tile(face_color[None, :], (len(faces_cell), 1))
+
+        mesh_cr = gl.MeshData(vertexes=verts_scaled, faces=faces_cell, faceColors=face_colors)
+        self.crystal_mesh = gl.GLMeshItem(meshdata=mesh_cr, smooth=False, drawEdges=False, drawFaces=True)
+        # translucent faces
+        self.crystal_mesh.setGLOptions('additive')
+        # position at center of Ewald sphere (keep centroid aligned)
+        self.crystal_center = np.array([0.0, 0.0, -self.ewald_rad], dtype=float)
+        self.crystal_mesh.translate(*self.crystal_center)
+        self.gl3d.addItem(self.crystal_mesh)
+        
+        # add highlighted outline (edges) for clarity
+        # explicit full edge list (12 edges for parallelepiped) to ensure complete outline
+        edges = np.array([[0,1],[0,2],[0,3],
+                          [1,4],[2,4],
+                          [1,5],[3,5],
+                          [2,6],[3,6],
+                          [7,4],[7,5],[7,6]], dtype=int)
+        segs = []
+        for u, v in edges:
+            segs.append(verts_scaled[u])
+            segs.append(verts_scaled[v])
+            segs.append([np.nan, np.nan, np.nan])
+        segs = np.array(segs, dtype=np.float32)
+        self.crystal_outline = gl.GLLinePlotItem()
+        self.crystal_outline.setData(pos=segs, color=(0.95, 0.95, 1.0, 0.95), width=2)
+        self.crystal_outline.translate(*self.crystal_center)
+        self.gl3d.addItem(self.crystal_outline)
+        """
+        verts, faces, edges = self.make_icosahedron_mesh(0.15)
+        face_color = np.array([0.55, 0.75, 1.0, 0.25], dtype=np.float32)
+        face_colors = np.tile(face_color[None, :], (len(faces), 1))
+        mesh_cr = gl.MeshData(vertexes=verts,
+                              faces=faces,
+                              faceColors=face_colors)
+        self.crystal_mesh = gl.GLMeshItem(meshdata=mesh_cr,
+                                          smooth=False,
+                                          drawEdges=True,
+                                          drawFaces=True)
+        self.crystal_mesh.setGLOptions('additive')
+        self.crystal_mesh.translate(0.0, 0.0, -self.ewald_rad)
+        self.gl3d.addItem(self.crystal_mesh)
+
         #################
         #    Vectors    #
         #################
@@ -1200,27 +1349,84 @@ class Visualizer(QtWidgets.QMainWindow):
             self.gl3d.addItem(_text_hkls)
             self.text_hkls_list.append(_text_hkls)
 
+    def make_icosahedron_mesh(self, scale=1.0):
+        """
+        Create a regular icosahedron suitable for pyqtgraph.gl.MeshData / GLMeshItem.
+
+        Returns:
+        - verts: (12,3) float32 vertex positions centered at origin (scaled)
+        - tri_faces: (20,3) int32 triangle indices
+        - edges: (30,2) int32 unique perimeter edges for outline
+        """
+        import numpy as _np
+        phi = (1.0 + _np.sqrt(5.0)) / 2.0
+
+        verts = _np.array([
+            (-1,  phi,  0),
+            ( 1,  phi,  0),
+            (-1, -phi,  0),
+            ( 1, -phi,  0),
+            ( 0, -1,  phi),
+            ( 0,  1,  phi),
+            ( 0, -1, -phi),
+            ( 0,  1, -phi),
+            ( phi,  0, -1),
+            ( phi,  0,  1),
+            (-phi,  0, -1),
+            (-phi,  0,  1),
+        ], dtype=float)
+
+        # 20 triangular faces (indices into verts)
+        faces = _np.array([
+            [0,11,5], [0,5,1], [0,1,7], [0,7,10], [0,10,11],
+            [1,5,9], [5,11,4], [11,10,2], [10,7,6], [7,1,8],
+            [3,9,4], [3,4,2], [3,2,6], [3,6,8], [3,8,9],
+            [4,9,5], [2,4,11], [6,2,10], [8,6,7], [9,8,1],
+        ], dtype=int)
+
+        # normalize to unit radius and apply scale
+        verts = verts / _np.linalg.norm(verts, axis=1).max() * float(scale)
+
+        # collect unique edges from triangle faces
+        edge_set = set()
+        for f in faces:
+            a, b, c = int(f[0]), int(f[1]), int(f[2])
+            edge_set.add(tuple(sorted((a, b))))
+            edge_set.add(tuple(sorted((b, c))))
+            edge_set.add(tuple(sorted((c, a))))
+        edges = _np.array(sorted(edge_set), dtype=int)
+
+        return verts.astype(_np.float32), faces.astype(_np.int32), edges.astype(_np.int32)
+
     def plot_add_detector(self):
-        if hasattr(self, 'plot_detector') and self.plot_detector in self.gl3d.items:
-            self.gl3d.removeItem(self.plot_detector)
+        #if hasattr(self, 'plot_detector') and self.plot_detector in self.gl3d.items:
+        #    self.gl3d.removeItem(self.plot_detector)
         if hasattr(self, 'detector_plane') and self.detector_plane in self.gl3d.items:
             self.gl3d.removeItem(self.detector_plane)
         if hasattr(self, 'detector_frame') and self.detector_frame in self.gl3d.items:
             self.gl3d.removeItem(self.detector_frame)
 
-        _scale = 1# / (self.plot_det_dist / 2) + 1
-        det_w = self.par['det_pix_x'] * self.par['det_pix_s'] / self.par['det_distance'] * self.plot_det_dist / 2 * _scale
-        det_h = self.par['det_pix_y'] * self.par['det_pix_s'] / self.par['det_distance'] * self.plot_det_dist / 2 * _scale
-        det_bch = det_w - self.par['det_poni_x'] / self.par['det_distance'] * self.plot_det_dist * _scale
-        det_bcv = det_h - self.par['det_poni_y'] / self.par['det_distance'] * self.plot_det_dist * _scale
+        # Determine scale factor to convert from real detector coordinates to plot coordinates
+        self.plot_scale_factor = self.par['det_distance'] / self.plot_det_dist
+
+        # Detector dimensions in plot coordinates
+        det_hor_full = self.par['det_pix_1'] * self.par['det_pix_s'] / self.plot_scale_factor
+        det_ver_full = self.par['det_pix_2'] * self.par['det_pix_s'] / self.plot_scale_factor
+        det_hor_half = det_hor_full / 2
+        det_ver_half = det_ver_full / 2
+        det_bch = self.par['det_poni_1'] / self.plot_scale_factor
+        det_bcv = self.par['det_poni_2'] / self.plot_scale_factor
 
         # Create a thin 3D mesh frame (rectangular ring) around the detector face so the edges are clearly visible
         # Extrude the ring by a small depth in z to give it volume
         frame_frac = 0.05
-        frame_thickness = max(min(det_w, det_h) * frame_frac, 1e-9)
-        inner_half_w = max(det_w + frame_thickness, 1e-9)
-        inner_half_h = max(det_h + frame_thickness, 1e-9)
+        frame_thickness = max(min(det_hor_half, det_ver_half) * frame_frac, 1e-9)
+        inner_half_w = max(det_hor_half + frame_thickness, 1e-9)
+        inner_half_h = max(det_ver_half + frame_thickness, 1e-9)
         half_depth = frame_thickness * 0.5
+        # vertical, horizontal, distance
+        #_translate = (-det_ver_half+det_bcv, -det_hor_half+det_bch, self.plot_det_dist)
+        _translate = (det_hor_half-det_bch, det_ver_half-det_bcv, self.plot_det_dist)
 
         verts_list = []
         faces_list = []
@@ -1265,13 +1471,13 @@ class Visualizer(QtWidgets.QMainWindow):
                                    base_idx+d])
 
         # Left box (strip)
-        add_box(-det_w, -det_h, -inner_half_w, det_h, -half_depth, half_depth)
+        add_box(-det_hor_half, -det_ver_half, -inner_half_w, det_ver_half, -half_depth, half_depth)
         # Right box
-        add_box(inner_half_w, -det_h, det_w, det_h, -half_depth, half_depth)
+        add_box(inner_half_w, -det_ver_half, det_hor_half, det_ver_half, -half_depth, half_depth)
         # Bottom box
-        add_box(-inner_half_w, -det_h, inner_half_w, -inner_half_h, -half_depth, half_depth)
+        add_box(-inner_half_w, -det_ver_half, inner_half_w, -inner_half_h, -half_depth, half_depth)
         # Top box
-        add_box(-inner_half_w, inner_half_h, inner_half_w, det_h, -half_depth, half_depth)
+        add_box(-inner_half_w, inner_half_h, inner_half_w, det_ver_half, -half_depth, half_depth)
 
         verts_arr = np.array(verts_list, dtype=np.float32)
         faces_arr = np.array(faces_list, dtype=np.int32)
@@ -1280,54 +1486,135 @@ class Visualizer(QtWidgets.QMainWindow):
         self.detector_frame = gl.GLMeshItem(meshdata=meshdata_frame, smooth=False, drawEdges=False, drawFaces=True)
         self.detector_frame.setGLOptions('translucent')
         self.detector_frame.setDepthValue(-1)
-        self.detector_frame.translate(det_bch, det_bcv, self.plot_det_dist)
+        self.detector_frame.translate(*_translate)
         self.gl3d.addItem(self.detector_frame)
 
         # Detector face
-        self.plot_detector = gl.GLSurfacePlotItem()
-        self.plot_detector.setGLOptions('additive')
-        self.plot_detector.setData(x=np.array([-det_w, det_w]),
-                                   y=np.array([-det_h, det_h]),
-                                   z=np.zeros((2, 2)))
-        self.plot_detector.setColor(self.color_detector)
-        self.plot_detector.setDepthValue(-1)
-        self.plot_detector.translate(det_bch,
-                                     det_bcv,
-                                     self.plot_det_dist)
-        self.gl3d.addItem(self.plot_detector)
+        #self.plot_detector = gl.GLSurfacePlotItem()
+        #self.plot_detector.setGLOptions('additive')
+        #self.plot_detector.setData(x=np.array([-det_hor_half, det_hor_half]),
+        #                           y=np.array([-det_ver_half, det_ver_half]),
+        #                           z=np.zeros((2, 2)))
+        #self.plot_detector.setColor(self.color_detector)
+        #self.plot_detector.setDepthValue(-1)
+        #self.plot_detector.translate(*_translate)
+        #self.gl3d.addItem(self.plot_detector)
 
         # Create a plane to represent the detector
-        verts = np.array([[-det_w, -det_h, 0],
-                          [ det_w, -det_h, 0],
-                          [ det_w,  det_h, 0],
-                          [-det_w,  det_h, 0],
-                          [     0,      0, 0]], dtype=np.float32)
-        faces = np.array([[1,2,4],
-                          [0,1,4],
-                          [2,3,4],
-                          [3,0,4]], dtype=np.int8)
-        colors = np.ones((len(faces), 4), dtype=np.float32) * np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
-        meshdata = gl.MeshData(vertexes=verts, faces=faces, faceColors=colors)
-        self.detector_plane = gl.GLMeshItem(meshdata=meshdata, smooth=True, drawEdges=False, edgeColor=(1,1,1,1), drawFaces=True)
-        self.detector_plane.setGLOptions('additive')
+        #verts = np.array([[-det_hor_half, -det_ver_half, 0],
+        #                  [ det_hor_half, -det_ver_half, 0],
+        #                  [ det_hor_half,  det_ver_half, 0],
+        #                  [-det_hor_half,  det_ver_half, 0],
+        #                  [     0,      0, 0]], dtype=np.float32)
+        #faces = np.array([[1,2,4],
+        #                  [0,1,4],
+        #                  [2,3,4],
+        #                  [3,0,4]], dtype=np.int8)
+        #colors = np.ones((len(faces), 4), dtype=np.float32) * np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+        #meshdata = gl.MeshData(vertexes=verts, faces=faces, faceColors=colors)
+        #self.detector_plane = gl.GLMeshItem(meshdata=meshdata, smooth=True, drawEdges=False, edgeColor=(1,1,1,1), drawFaces=True)
+        #self.detector_plane.setGLOptions('additive')
+        #self.detector_plane.setDepthValue(-1)
+        #self.detector_plane.translate(*_translate)
+        #self.gl3d.addItem(self.detector_plane)
+
+        #import h5py
+        #with h5py.File('/Users/au577597/Library/CloudStorage/OneDrive-Aarhusuniversitet/Github/ReciprocalPlayground/SFX/1334180_compact.h5', 'r') as h5f:
+        #    img_data = h5f['/entry/instrument/detector/detector_data'][0,:,:]
+        RGBA, has_alpha = pg.makeARGB(self.det_img_data, lut=pg.colormap.get('viridis').getLookupTable(0.0, 1.0, 64), levels=(0, 100))
+        self.detector_plane = gl.GLImageItem(RGBA)
         self.detector_plane.setDepthValue(-1)
-        self.detector_plane.translate(det_bch, det_bcv, self.plot_det_dist)
+        self.detector_plane.scale(det_hor_full/RGBA.shape[0], det_ver_full/RGBA.shape[1], 1)
+        self.detector_plane.translate(*(_translate-np.array([det_hor_half, det_ver_half, 0])))
         self.gl3d.addItem(self.detector_plane)
 
     def gui_update_detector(self):
+        # compute previous PONI in pixels
+        old_poni_px_1 = self.par['det_poni_1'] / self.par['det_pix_s']
+        old_poni_px_2 = self.par['det_poni_2'] / self.par['det_pix_s']
+        old_det_px_1 = self.par['det_pix_1']
+        old_det_px_2 = self.par['det_pix_2']
+
         # Update detector parameters from GUI
         self.par['det_distance'] = self.gui_det_distance.value() * 1E-3
-        self.par['det_pix_x'] = self.gui_det_dim_1.value()
-        self.par['det_pix_y'] = self.gui_det_dim_2.value()
+        self.par['det_pix_1'] = self.gui_det_dim_1.value()
+        self.par['det_pix_2'] = self.gui_det_dim_2.value()
         self.par['det_pix_s'] = self.gui_det_pix_size.value() * 1E-6
 
-        # Reset poni to detector center
-        # This does not work with custom poni positions -> future problem!
-        self.par['det_poni_x'] = self.par['det_pix_x'] * self.par['det_pix_s'] / 2
-        self.par['det_poni_y'] = self.par['det_pix_y'] * self.par['det_pix_s'] / 2
+        # preserve fractional position relative to detector dimensions
+        # compute fraction within old detector [0..1]
+        frac_x = old_poni_px_1 / old_det_px_1
+        frac_y = old_poni_px_2 / old_det_px_2
+        # map to new pixel coordinates and then to physical units
+        new_px_x = frac_x * float(self.par['det_pix_1'])
+        new_px_y = frac_y * float(self.par['det_pix_2'])
+        self.par['det_poni_1'] = new_px_x * self.par['det_pix_s']
+        self.par['det_poni_2'] = new_px_y * self.par['det_pix_s']
 
         self.plot_add_detector()
         self.rotate_gon_tth(relative=False)
+
+    def gui_detector_image(self,
+                           shape=(1920, 1920),
+                           background_level=1.0,
+                           noise_sigma=1.0,
+                           gauss_amp=100.0,
+                           gauss_sigma=50.0,
+                           gauss_center=None,
+                           seed=None):
+        """
+        Create a 2D placeholder detector image with Gaussian air-scattering peak + noisy background.
+
+        Parameters
+        - shape : tuple[int,int]
+            (height, width) of the image in pixels.
+        - background_level : float
+            Constant background counts (baseline air scatter).
+        - noise_sigma : float
+            Standard deviation of additive Gaussian noise (counts).
+        - gauss_amp : float
+            Peak amplitude of the Gaussian air-scatter contribution (above background).
+        - gauss_sigma : float
+            Gaussian sigma in pixels (isotropic).
+        - gauss_center : tuple[float,float] | None
+            (y, x) center of the Gaussian in pixels. If None, center of the image is used.
+        - seed : int | None
+            RNG seed for reproducible noise.
+
+        Returns
+        - img : np.ndarray, shape (H, W), dtype=float32
+            Simulated detector intensity image (counts).
+        """
+        import numpy as _np
+        rng = _np.random.default_rng(seed)
+
+        H, W = shape
+        if gauss_center is None:
+            cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+        else:
+            cy, cx = float(gauss_center[0]), float(gauss_center[1])
+
+        y = _np.arange(H, dtype=_np.float32)[:, None]
+        x = _np.arange(W, dtype=_np.float32)[None, :]
+
+        r2 = (y - cy)**2 + (x - cx)**2
+        gauss = gauss_amp * _np.exp(-0.5 * r2 / (gauss_sigma**2))
+
+        # Baseline + gaussian signal
+        img = background_level + gauss
+
+        # Additive Gaussian noise
+        if noise_sigma > 0:
+            img = img + rng.normal(loc=0.0, scale=noise_sigma, size=img.shape)
+
+        # Convert to Poisson-distributed counts (simulate photon noise)
+        # ensure non-negative mean for Poisson
+        lam = _np.clip(img, 0, None)
+        img = rng.poisson(lam).astype(_np.float32)
+
+        # final cleanup: no negative values
+        _np.clip(img, 0.0, None, out=img)
+        return img
 
     def gui_toggle_generic(self, state, attribute, plot_item):
         setattr(self, attribute, state)
@@ -1476,19 +1763,24 @@ class Visualizer(QtWidgets.QMainWindow):
         # real space scattering vectors
         rsvs = c_kds * rsl[:,None]
         # x, y projection, relative to beam center, in pixel
-        pxs = (rsvs[:,0] * 1E-10 + self.par['det_poni_x']) / self.par['det_pix_s']
-        pys = (rsvs[:,1] * 1E-10 + self.par['det_poni_y']) / self.par['det_pix_s']
-        c_xys = np.vstack([pxs, pys]).T
+        pxs = (rsvs[:,0] * 1E-10 + self.par['det_poni_1']) / self.par['det_pix_s']
+        pys = (rsvs[:,1] * 1E-10 + self.par['det_poni_2']) / self.par['det_pix_s']
+        c_xys = np.vstack([pys, pxs]).T
         cond_visible = np.where((c_xys[:,0] > 0)&
                                 (c_xys[:,1] > 0)&
-                                (c_xys[:,0] < self.par['det_pix_x'])&
-                                (c_xys[:,1] < self.par['det_pix_y'])&
+                                (c_xys[:,0] < self.par['det_pix_2'])&
+                                (c_xys[:,1] < self.par['det_pix_1'])&
                                 (c_kds[:,2] > 0))
 
         v_qs = c_qs[cond_visible]
         v_det = np.zeros((0,3), dtype=float)
         v_pc = np.zeros((0,3), dtype=float)
-        if len(c_hkls[cond_visible]) > 0:
+
+        if len(v_qs) == 0:
+            self.plot_diff_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
+            self.plot_scat_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
+        else:
+            # calculate detector intersection points and partiality correction
             v_l0 = np.array([0, 0, -self.ewald_rad])
             v_kds = v_qs - v_l0
             # v_p0 not equal to -v_n after detector correction (roll, pitch, yaw)
@@ -1497,11 +1789,7 @@ class Visualizer(QtWidgets.QMainWindow):
             v_scale = ((v_p0 - v_l0) @ v_n) / (v_kds @ v_n)
             v_det = v_kds * v_scale[:, None] + v_l0
             v_pc = correction_partiality_geometric(v_kds, self.ewald_rad, self.par['sfx_spectral_width'], self.par['sfx_rlp_size'])
-
-        if len(v_qs) == 0:
-            self.plot_diff_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
-            self.plot_scat_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
-        else:
+            # plot scattering and diffracted beam vectors
             edges = np.vstack([np.zeros(len(v_det), dtype=int), np.arange(1, len(v_det)+1, 1)]).T
             nodes = np.vstack([np.array([0, 0, -self.ewald_rad]), v_det])
             self.plot_diff_vecs.setData(edges=edges, nodePositions=nodes)
@@ -1509,8 +1797,7 @@ class Visualizer(QtWidgets.QMainWindow):
                 edges = np.vstack([np.zeros(len(v_qs), dtype=int), np.arange(1, len(v_qs)+1, 1)]).T
                 nodes = np.vstack([np.array([0, 0, 0]), v_qs])
                 self.plot_scat_vecs.setData(edges=edges, nodePositions=nodes)
-        
-        return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_pc]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'pc'])
+            return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_pc]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'pc'])
 
     def scan_update(self):
         # Update the gui to rotate the scene objects (goniometer)
@@ -1537,7 +1824,7 @@ class Visualizer(QtWidgets.QMainWindow):
         _scan_data = self.scan_increment()
 
         # append/display new data
-        if len(_scan_data) > 0:
+        if _scan_data is not None and len(_scan_data) > 0:
             self.scan_data = self.scan_data.merge(_scan_data, how='outer')
             if not self.sfx_keep_all_data:
                 self.scan_data.drop_duplicates(subset=['h','k','l'], keep='last', inplace=True)
@@ -1608,6 +1895,9 @@ class Visualizer(QtWidgets.QMainWindow):
         # remove partiality column if not requested
         if not self.gui_show_sfx_parcor.isChecked():
             self.gui_dat_tab.setColumnCount(4)
+        
+        # Signal GUI that scan is finished
+        self.sigScanFinished.emit()
 
     def scan_toggle(self):
         if not self.scan_timer.isActive():
@@ -1619,6 +1909,21 @@ class Visualizer(QtWidgets.QMainWindow):
             self.gui_start_scan.setText('Continue Scan')
             self.gui_start_scan.setStyleSheet("background-color: #006A67")
             self.scan_timer.stop()
+
+    def strat_toggle(self):
+        if self.scan_timer.isActive():
+            return
+        for row in range(self.gui_strat_tab.rowCount()):
+            self.gui_gon_omg.setValue(float(self.gui_strat_tab.item(row, 0).text()))
+            self.gui_gon_chi.setValue(float(self.gui_strat_tab.item(row, 1).text()))
+            self.gui_gon_phi.setValue(float(self.gui_strat_tab.item(row, 2).text()))
+            self.gui_scan_step.setValue(float(self.gui_strat_tab.item(row, 3).text()))
+            self.gui_scan_range.setValue(int(self.gui_strat_tab.item(row, 4).text()))
+            self.gui_strat_tab.selectRow(row)
+            self.scan_toggle()
+            loop = QtCore.QEventLoop()
+            self.sigScanFinished.connect(loop.exit)
+            loop.exec()
 
     def look_along(self, vec):
         # Helper to set camera to look along a given axis vector
@@ -1642,22 +1947,28 @@ class Visualizer(QtWidgets.QMainWindow):
         # Compute the cell axes (in meters) and apply current goniometer rotation (phi, chi, omega)
         if ev.key() == QtCore.Qt.Key.Key_F1:
             # look down rotated a axis
-            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.OM_UC * 1E-10)[:, 0])
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.OM_UC * 1E-10)[:, 0])
+            self.look_along_option *= -1
         elif ev.key() == QtCore.Qt.Key.Key_F2:
             # look down rotated b axis
-            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.OM_UC * 1E-10)[:, 1])
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.OM_UC * 1E-10)[:, 1])
+            self.look_along_option *= -1
         elif ev.key() == QtCore.Qt.Key.Key_F3:
             # look down rotated c axis
-            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.OM_UC * 1E-10)[:, 2])
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.OM_UC * 1E-10)[:, 2])
+            self.look_along_option *= -1
         elif ev.key() == QtCore.Qt.Key.Key_F4:
             # look down current omega goniometer axis (apply combined gon rotation)
-            self.look_along(self.gon_rot_ax1.to_rotation_matrix() @ self.par['gon_omg_axs'])
+            self.look_along(self.gon_rot_ax1.to_rotation_matrix() @ (self.look_along_option * self.par['gon_omg_axs']))
+            self.look_along_option *= -1
         elif ev.key() == QtCore.Qt.Key.Key_F5:
             # look down current chi axis
-            self.look_along(self.gon_rot_ax2.to_rotation_matrix() @ self.par['gon_chi_axs'])
+            self.look_along(self.gon_rot_ax2.to_rotation_matrix() @ (self.look_along_option * self.par['gon_chi_axs']))
+            self.look_along_option *= -1
         elif ev.key() == QtCore.Qt.Key.Key_F6:
             # look down current phi axis
-            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ self.par['gon_phi_axs'])
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.par['gon_phi_axs']))
+            self.look_along_option *= -1
         elif ev.key() == QtCore.Qt.Key.Key_C:
             self.gl3d.cameraParams()
         elif ev.key() == QtCore.Qt.Key.Key_S:
@@ -1713,6 +2024,12 @@ class Visualizer(QtWidgets.QMainWindow):
         self.plot_gon_chi.rotate(ang2, *ax2)
         self.plot_gon_omg.rotate(ang1, *ax1)
 
+        # Rotate crystal about the goniometer axes but keep it centered at the Ewald center.
+        # We translate the mesh to the global goniometer origin, rotate, then translate back.
+        self.crystal_mesh.translate(0.0, 0.0, self.ewald_rad)
+        self.crystal_mesh.rotate(ang3, *ax3)
+        self.crystal_mesh.translate(0.0, 0.0, -self.ewald_rad)
+
     def rotate_gon_tth(self, relative=True):
         # Apply 2theta rotation changes from GUI to all relevant items in the 3D scene
         # calculate new 2theta rotation
@@ -1729,13 +2046,18 @@ class Visualizer(QtWidgets.QMainWindow):
             axs, ang = gon_rot_delta.get_axis_angle()
             ang = np.rad2deg(ang)
         else:
+            self.gon_rot_tth = gon_rot_new
             axs, ang = gon_rot_new.get_axis_angle()
             ang = np.rad2deg(ang)
 
-        self.plot_detector.rotate(ang, *axs)
+        # Rotate the detector plot
+        if hasattr(self, 'plot_detector'):
+          self.plot_detector.rotate(ang, *axs)
         # Rotate the mesh detector and the frame so they stay aligned
-        self.detector_plane.rotate(ang, *axs)
-        self.detector_frame.rotate(ang, *axs)
+        if hasattr(self, 'detector_plane'):
+            self.detector_plane.rotate(ang, *axs)
+        if hasattr(self, 'detector_frame'):
+            self.detector_frame.rotate(ang, *axs)
 
 if __name__ == '__main__':
     app = pg.mkQApp()
