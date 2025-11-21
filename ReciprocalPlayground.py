@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+from OpenGL.GL import glGetDoublev, GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 import numpy as np
@@ -18,8 +19,9 @@ pg.setConfigOptions(antialias=True)
 # todo
 # gui toggles behave erratically
 # add strategy calculation / optimization
+# unify gui checkboxes, toggle states and initializations
 
-__version__ = 'v0.0.6, 04.11.2025'
+__version__ = 'v0.0.7, 21.11.2025'
 
 def signed_angle(v1: np.ndarray, v2: np.ndarray, up_reference: np.ndarray) -> float:
         cross = np.cross(v1, v2)
@@ -253,6 +255,50 @@ class Quaternion:
     def __repr__(self) -> str:
         return self.__str__()
 
+class GLWrappedTextItem(gl.GLTextItem):
+    def paint(self):
+        if len(self.text) < 1:
+            return
+        self.setupGLState()
+
+        project = self.compute_projection()
+        vec3 = QtGui.QVector3D(*self.pos)
+        text_rect = self.align_text(project.map(vec3).toPointF())
+
+        painter = QtGui.QPainter(self.view())
+        painter.setPen(self.color)
+        painter.setBackground(QtGui.QBrush(QtGui.QColor(0,0,0,64)))
+        painter.setBackgroundMode(QtCore.Qt.BGMode.OpaqueMode)
+        painter.setFont(self.font)
+        painter.setRenderHints(QtGui.QPainter.RenderHint.Antialiasing | QtGui.QPainter.RenderHint.TextAntialiasing)
+        painter.drawText(text_rect, self.alignment, self.text)
+        #painter.drawRect(text_rect)
+        painter.end()
+
+    def align_text(self, pos:QtCore.QPointF, margin:float=1.05) -> QtCore.QRectF:
+        """
+        Aligns the text at the given position according to the given alignment.
+        """
+        font_metrics = QtGui.QFontMetrics(self.font)
+        text_box_size = np.array([(font_metrics.boundingRect(i).width(), font_metrics.boundingRect(i).height()) for i in self.text.splitlines()])
+        text_rect = QtCore.QRectF(0, 0, np.max(text_box_size[:, 0]) * margin, np.sum(text_box_size[:, 1]) * margin)
+        
+        dx = dy = 0.0
+        if self.alignment & QtCore.Qt.AlignmentFlag.AlignRight:
+            dx = text_rect.width()
+        if self.alignment & QtCore.Qt.AlignmentFlag.AlignHCenter:
+            dx = text_rect.width() / 2.0
+        if self.alignment & QtCore.Qt.AlignmentFlag.AlignBottom:
+            dy = text_rect.height()
+        if self.alignment & QtCore.Qt.AlignmentFlag.AlignVCenter:
+            dy = text_rect.height() / 2.0
+        
+        pos.setX(pos.x() - dx)
+        pos.setY(pos.y() + dy)
+        text_rect.moveTopLeft(pos)
+        
+        return text_rect
+
 def cart_from_cell(cell):
     """
     Calculate a,b,c vectors in cartesian system from lattice constants.
@@ -359,7 +405,7 @@ def PolCorFromkfs(kf: np.array, pol_deg: float) -> np.array:
     norm_kfs = np.linalg.norm(kf,axis=1)
     
     pc=((1-2*pol_deg)*(1-(dot_pol_plane_normal_kds / norm_kfs)**2) + pol_deg*(1+(dot_kfs_ki / (norm_kfs * norm_ki))**2) )
-    return pc # Divide by this.
+    return pc.reshape(-1,1) # Divide by this.
 
 def calc_angles(v1, v2):
     return np.arccos(np.sum(v1*v2, axis=1) / (np.linalg.norm(v1, axis=1)*np.linalg.norm(v2, axis=1))).reshape(-1,1)
@@ -422,18 +468,18 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gl3d.setBackgroundColor((10, 20, 20))
         central_widget.addWidget(self.gl3d)
 
-        self.DEBUG = False
-
         self.orth_proj = False
         self.show_cell_axs = True
         self.show_cell_axs_lbl = True
         self.show_gon_axs = True
         self.show_gon_axs_lbl = True
         self.show_cell_outline = True
+        self.show_crystal = True
         self.show_detector = True
         self.show_ewald = True
-        self.show_text_hkls = True
+        self.show_ewald_labels = True
 
+        self.show_detector_labels = True
         self.show_scat_vecs = True
         self.show_diff_vecs = True
         self.show_scat_latt = True
@@ -443,22 +489,22 @@ class Visualizer(QtWidgets.QMainWindow):
         
         # SFX
         self.sfx_keep_all_data = False
-        self.show_sfx_parcor = False
+        #self.show_sfx_parcor = False
 
         #self.setGeometry(0, 0, 1920, 1080)
         self.setGeometry(500, 0, 1280, 768)
         self.plot_fnt_tab = QtGui.QFont('Helvetica', 14)
         self.plot_fnt_lbl = QtGui.QFont('Helvetica', 18)
-        self.plot_fnt_hkl = QtGui.QFont('Helvetica', 20)
+        self.plot_fnt_hkl = QtGui.QFont('Helvetica', 18)
         self.plot_line_width = 1
-        self.plot_line_width_thick = 3
+        self.plot_line_width_thick = 4
 
         # Colorsself.color_scat_latt
         self.color_scat_latt = QtGui.QColor(80, 80, 80, 50)
         self.color_scat_symm = QtGui.QColor(111, 164, 175, 200)
         self.color_scat_data = QtGui.QColor(129, 24, 68, 200)
         self.color_scat_scan = QtGui.QColor(245, 173, 24, 200)
-        self.color_labl_hkls = QtGui.QColor(200, 200, 200, 255)
+        self.color_labl_hkls = QtGui.QColor(255, 255, 255, 255)
         #self.color_labl_hkls = QtGui.QColor(255, 0, 96, 255)
         self.color_scat_vecs = QtGui.QColor(245, 173, 24, 200)
         self.color_diff_vecs = QtGui.QColor(255, 0, 96, 200)
@@ -481,6 +527,7 @@ class Visualizer(QtWidgets.QMainWindow):
                     'det_pix_s':75.0E-6,
                     'det_pix_1':2068,
                     'det_pix_2':2162,
+                    'polarization':0.99,
                     'wavelength':0.59040E-10,# 21.0 keV
                     #'wavelength':0.56356E-10,# 22.0 keV"
                     'ewald_offset':0.005,
@@ -604,9 +651,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.init_gui()
         self.init_gui_parameters()
         self.init_plot()
-
-        # Initial toggle states
-        self.gui_toggle_hkls(self.show_text_hkls)
+        self.init_goniometer()
 
         # Collapse all widgets
         for widget in self.parameter_box.children():
@@ -637,12 +682,12 @@ class Visualizer(QtWidgets.QMainWindow):
         # Ewald sphere
         self.gui_show_ewald = QtWidgets.QCheckBox()
         self.gui_show_ewald.setChecked(self.show_ewald)
-        self.gui_show_ewald.stateChanged.connect(self.gui_toggle_ewald)
+        self.gui_show_ewald.stateChanged.connect(self.gui_toggle_ewald_sphere)
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Ewald Sphere"), self.gui_show_ewald)
         # show hkls of scan data
         self.gui_show_hkls = QtWidgets.QCheckBox()
-        self.gui_show_hkls.setChecked(self.show_text_hkls)
-        self.gui_show_hkls.stateChanged.connect(self.gui_toggle_hkls)
+        self.gui_show_hkls.setChecked(self.show_ewald_labels)
+        self.gui_show_hkls.stateChanged.connect(self.gui_toggle_ewald_labels)
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show hkl labels"), self.gui_show_hkls)
         # show reciprocal lattice points
         self.gui_show_latt = QtWidgets.QCheckBox()
@@ -674,6 +719,11 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_show_cell.setChecked(self.show_cell_outline)
         self.gui_show_cell.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_cell_outline', self.plot_cell))
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Unit Cell"), self.gui_show_cell)
+        # Crystal
+        self.gui_show_cryst = QtWidgets.QCheckBox()
+        self.gui_show_cryst.setChecked(self.show_crystal)
+        self.gui_show_cryst.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_crystal', self.crystal_mesh))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Crystal"), self.gui_show_cryst)
         # Cell axes
         self.gui_show_axes = QtWidgets.QCheckBox()
         self.gui_show_axes.setTristate(True)
@@ -691,6 +741,11 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_show_detector.setChecked(self.show_detector)
         self.gui_show_detector.stateChanged.connect(self.gui_toggle_detector)
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector"), self.gui_show_detector)
+        # Detector labels
+        self.gui_show_detector_labels = QtWidgets.QCheckBox()
+        self.gui_show_detector_labels.setChecked(self.show_detector_labels)
+        self.gui_show_detector_labels.stateChanged.connect(self.gui_toggle_detector_labels)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector Labels"), self.gui_show_detector_labels)
 
         # Experimental Information
         self.box_sample_layout = self.add_dock_widget("Experimental")
@@ -877,7 +932,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_scan_step.setMinimum(0.001)
         self.gui_scan_step.setMaximum(1)
         self.gui_scan_step.setDecimals(3)
-        self.gui_scan_step.setSingleStep(0.1)
+        self.gui_scan_step.setSingleStep(0.01)
         self.gui_scan_step.setValue(self.par['scan_step'])
         self.gui_scan_step.setSuffix('°')
         self.box_scan_layout.addRow(QtWidgets.QLabel("Scan Step"), self.gui_scan_step)
@@ -936,9 +991,9 @@ class Visualizer(QtWidgets.QMainWindow):
 
         # SFX parameters
         self.box_sfx_layout = self.add_dock_widget("SFX Parameters")
-        self.gui_show_sfx_parcor = QtWidgets.QCheckBox()
-        self.gui_show_sfx_parcor.setChecked(self.show_sfx_parcor)
-        self.box_sfx_layout.addRow(QtWidgets.QLabel("Show ParCor"), self.gui_show_sfx_parcor)
+        #self.gui_show_sfx_parcor = QtWidgets.QCheckBox()
+        #self.gui_show_sfx_parcor.setChecked(self.show_sfx_parcor)
+        #self.box_sfx_layout.addRow(QtWidgets.QLabel("Show ParCor"), self.gui_show_sfx_parcor)
         self.gui_sfx_keep_all_data = QtWidgets.QCheckBox()
         self.gui_sfx_keep_all_data.setChecked(self.sfx_keep_all_data)
         self.box_sfx_layout.addRow(QtWidgets.QLabel("Keep All Data"), self.gui_sfx_keep_all_data)
@@ -966,8 +1021,8 @@ class Visualizer(QtWidgets.QMainWindow):
         # Data collection
         self.box_dat_layout = self.add_dock_widget("Data Collection")
         self.gui_dat_tab = QtWidgets.QTableWidget()
-        self.gui_dat_tab.setColumnCount(5)
-        self.gui_dat_tab.setHorizontalHeaderLabels(['h', 'k', 'l', 'd', 'pc'])
+        self.gui_dat_tab.setColumnCount(6)
+        self.gui_dat_tab.setHorizontalHeaderLabels(['h', 'k', 'l', 'd', 'poc', 'pac'])
         # Right align table contents
         class AlignDelegate(QtWidgets.QStyledItemDelegate):
             def initStyleOption(self, option, index):
@@ -978,16 +1033,17 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_dat_tab.setItemDelegate(AlignDelegate())
         self.gui_dat_tab.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.gui_dat_tab.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.gui_dat_tab.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self.gui_dat_tab.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
         self.gui_dat_tab.setAlternatingRowColors(True)
         self.gui_dat_tab.setSortingEnabled(True)
         self.gui_dat_tab.setFont(self.plot_fnt_tab)
         self.gui_dat_tab.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         #self.gui_dat_tab.horizontalHeader().setVisible(False)
         #self.gui_dat_tab.verticalHeader().setVisible(False)
+        self.gui_dat_tab.itemSelectionChanged.connect(self.data_table_selection_changed)
         self.gui_dat_tab.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.gui_dat_tab.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        # Set hkl columns to resize to contents
+        # Set i, hkl columns to resize to contents
         self.gui_dat_tab.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.gui_dat_tab.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.gui_dat_tab.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
@@ -996,6 +1052,10 @@ class Visualizer(QtWidgets.QMainWindow):
         # Set minimum width of parameter scroll area to fit all unfolded parameters
         self.parameter_scroll.setMinimumWidth(self.parameter_box.sizeHint().width() + 20)
 
+    def data_table_selection_changed(self):
+        rows = [i.data(QtCore.Qt.ItemDataRole.UserRole) for i in self.gui_dat_tab.selectedItems() if i.column() == 0]
+        self.scan_add_labels(self.scan_data.loc[rows])
+    
     def init_gui_parameters(self):
         # Update parameters from GUI
         self.par['sample_cell_a'] = self.gui_sample_a.value()
@@ -1027,9 +1087,9 @@ class Visualizer(QtWidgets.QMainWindow):
         self.hkls = calc_hkls(self.OM_UC, self.par['max_resolution'])
         #self.hkls_set = set(map(tuple, self.hkls))
         self.hkls_num = len(self.hkls)
-        
         self.hkl_bases = self.hkls @ self.OM_UC.T * 1E-10
-        self.last_label_idx = 0
+
+    def init_goniometer(self):
         # Reset scan progress
         self.scan_data = pd.DataFrame(columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz'])
         self.scan_symm = set()
@@ -1153,7 +1213,7 @@ class Visualizer(QtWidgets.QMainWindow):
                                               pxMode=False)
         self.gl3d.addItem(self.scat_data)
 
-        # Scanned scan point
+        # Scanned RLP
         self.scat_scan = gl.GLScatterPlotItem(size=0.075,
                                               color=self.color_scat_scan,
                                               pxMode=False)
@@ -1225,82 +1285,7 @@ class Visualizer(QtWidgets.QMainWindow):
         ##################
         # Create crystal #
         ##################
-        """
-        # Build a transparent crystal mesh from the sample unit cell parameters and
-        # highlight its outline. Use the rotated cell axes (cell_axs) defined above.
-        # cell_axs already computed above as self.OM_UC * 1E-10
-        inv_cell_axs = np.linalg.inv(cell_axs.T)
-        axs_a = inv_cell_axs[:, 0]
-        axs_b = inv_cell_axs[:, 1]
-        axs_c = inv_cell_axs[:, 2]
-        # 8 corners of the unit cell
-        verts_cell = np.vstack([
-            np.zeros(3),
-            axs_a,
-            axs_b,
-            axs_c,
-            axs_a + axs_b,
-            axs_a + axs_c,
-            axs_b + axs_c,
-            axs_a + axs_b + axs_c,
-        ])
-        # center geometry around its centroid
-        centroid = verts_cell.mean(axis=0)
-        verts_centered = verts_cell - centroid
-        # scale to fit nicely inside Ewald sphere (fraction of radius)
-        max_len = np.max(np.linalg.norm(verts_centered, axis=1))
-        target = max(self.ewald_rad * 0.1, 1e-6)
-        scale = target / max_len if max_len > 0 else 1.0
-        verts_scaled = (verts_centered * scale).astype(np.float32)
-
-        # use only 6 triangular faces (one triangle per parallelepiped face) to reduce face count
-        faces_cell = np.array([
-            # bottom (0,1,4,2)
-            [0, 1, 4], [0, 4, 2],
-            # top    (3,5,7,6)
-            [3, 5, 7], [3, 7, 6],
-            # front  (0,1,5,3)
-            [0, 1, 5], [0, 5, 3],
-            # back   (2,4,7,6)
-            [2, 4, 7], [2, 7, 6],
-            # left   (0,2,6,3)
-            [0, 2, 6], [0, 6, 3],
-            # right  (1,4,7,5)
-            [1, 4, 7], [1, 7, 5],
-        ], dtype=np.int32)
-
-        # transparent face colors (slightly bluish)
-        face_color = np.array([0.65, 0.75, 1.0, 0.25], dtype=np.float32)
-        face_colors = np.tile(face_color[None, :], (len(faces_cell), 1))
-
-        mesh_cr = gl.MeshData(vertexes=verts_scaled, faces=faces_cell, faceColors=face_colors)
-        self.crystal_mesh = gl.GLMeshItem(meshdata=mesh_cr, smooth=False, drawEdges=False, drawFaces=True)
-        # translucent faces
-        self.crystal_mesh.setGLOptions('additive')
-        # position at center of Ewald sphere (keep centroid aligned)
-        self.crystal_center = np.array([0.0, 0.0, -self.ewald_rad], dtype=float)
-        self.crystal_mesh.translate(*self.crystal_center)
-        self.gl3d.addItem(self.crystal_mesh)
-        
-        # add highlighted outline (edges) for clarity
-        # explicit full edge list (12 edges for parallelepiped) to ensure complete outline
-        edges = np.array([[0,1],[0,2],[0,3],
-                          [1,4],[2,4],
-                          [1,5],[3,5],
-                          [2,6],[3,6],
-                          [7,4],[7,5],[7,6]], dtype=int)
-        segs = []
-        for u, v in edges:
-            segs.append(verts_scaled[u])
-            segs.append(verts_scaled[v])
-            segs.append([np.nan, np.nan, np.nan])
-        segs = np.array(segs, dtype=np.float32)
-        self.crystal_outline = gl.GLLinePlotItem()
-        self.crystal_outline.setData(pos=segs, color=(0.95, 0.95, 1.0, 0.95), width=2)
-        self.crystal_outline.translate(*self.crystal_center)
-        self.gl3d.addItem(self.crystal_outline)
-        """
-        verts, faces, edges = self.make_icosahedron_mesh(0.15)
+        verts, faces, edges = self.make_icosahedron_mesh(scale=0.15)
         face_color = np.array([0.55, 0.75, 1.0, 0.25], dtype=np.float32)
         face_colors = np.tile(face_color[None, :], (len(faces), 1))
         mesh_cr = gl.MeshData(vertexes=verts,
@@ -1320,34 +1305,49 @@ class Visualizer(QtWidgets.QMainWindow):
         # Incident beam vector
         self.ewald_ki = gl.GLLinePlotItem()
         self.ewald_ki.setData(pos=np.array([[0,0,-self.ewald_rad*2],[0,0,-self.ewald_rad]]),
-                        color="#AB1E6E", width=self.plot_line_width)
+                        color="#AB1E6E", width=self.plot_line_width_thick)
         self.gl3d.addItem(self.ewald_ki)
-        # diffracted beam vector
+        # Primary beam vector
         self.ewald_ko = gl.GLLinePlotItem()
         self.ewald_ko.setData(pos=np.array([[0,0,-self.ewald_rad],[0,0,0]]),
-                        color="#1EAB60", width=self.plot_line_width)
+                        color="#1EAB60", width=self.plot_line_width_thick)
         self.gl3d.addItem(self.ewald_ko)
         # Scattering vectors
         self.plot_scat_vecs = gl.GLGraphItem(edgeColor=self.color_scat_vecs,
                                              nodeColor=self.color_scat_vecs,
-                                             edgeWidth=self.plot_line_width)
+                                             edgeWidth=self.plot_line_width_thick)
         self.gl3d.addItem(self.plot_scat_vecs)
         # Diffracted beam vectors
         self.plot_diff_vecs = gl.GLGraphItem(edgeColor=self.color_diff_vecs,
                                              nodeColor=self.color_diff_vecs,
-                                             edgeWidth=self.plot_line_width)
+                                             edgeWidth=self.plot_line_width_thick)
         self.gl3d.addItem(self.plot_diff_vecs)
 
         #################
         #   hkl Labels  #
         #################
         # hkl text labels
-        self.text_hkls_list = []
+        self.list_ewald_labels = []
         for _ in range(self.par['plot_max_hkl_labels']):
-            _text_hkls = gl.GLTextItem(font=self.plot_fnt_hkl,
-                                       color=self.color_labl_hkls)
+
+            _text_hkls = GLWrappedTextItem(font=self.plot_fnt_hkl,
+                                           color=self.color_labl_hkls,
+                                           alignment=QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop)
             self.gl3d.addItem(_text_hkls)
-            self.text_hkls_list.append(_text_hkls)
+            self.list_ewald_labels.append(_text_hkls)
+
+        # hkl text labels (detector)
+        self.list_detector_labels = []
+        for _ in range(self.par['plot_max_hkl_labels']):
+            _text_hkls = GLWrappedTextItem(font=self.plot_fnt_hkl,
+                                           color=self.color_labl_hkls,
+                                           alignment=QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop)
+            self.gl3d.addItem(_text_hkls)
+            self.list_detector_labels.append(_text_hkls)
+
+        # Initial toggle states
+        self.gui_toggle_ewald_labels(self.show_ewald_labels)
+        self.gui_toggle_detector_labels(self.show_detector_labels)
 
     def make_icosahedron_mesh(self, scale=1.0):
         """
@@ -1620,12 +1620,17 @@ class Visualizer(QtWidgets.QMainWindow):
         setattr(self, attribute, state)
         plot_item.setVisible(state)
 
-    def gui_toggle_hkls(self, state):
-        self.show_text_hkls = state
-        for txt in self.text_hkls_list:
-            txt.setVisible(self.show_text_hkls)
+    def gui_toggle_ewald_labels(self, state):
+        self.show_ewald_labels = state
+        for txt in self.list_ewald_labels:
+            txt.setVisible(self.show_ewald_labels)
     
-    def gui_toggle_ewald(self, state):
+    def gui_toggle_detector_labels(self, state):
+        self.show_detector_labels = state
+        for txt in self.list_detector_labels:
+            txt.setVisible(self.show_detector_labels)
+
+    def gui_toggle_ewald_sphere(self, state):
         self.show_ewald = state
         self.ewald_sphere.setVisible(self.show_ewald)
         self.ewald_outline_ab.setVisible(self.show_ewald)
@@ -1636,7 +1641,7 @@ class Visualizer(QtWidgets.QMainWindow):
 
     def gui_toggle_detector(self, state):
         self.show_detector = state
-        self.plot_detector.setVisible(self.show_detector)
+        #self.plot_detector.setVisible(self.show_detector)
         self.scat_pattern.setVisible(self.show_detector)
         self.detector_plane.setVisible(self.show_detector)
         self.detector_frame.setVisible(self.show_detector)
@@ -1716,6 +1721,7 @@ class Visualizer(QtWidgets.QMainWindow):
     def restart_new_cell(self):
         # get new parameters from GUI
         self.init_gui_parameters()
+        self.init_goniometer()
         # clear plot
         self.gl3d.clear()
         # redraw plot
@@ -1774,7 +1780,6 @@ class Visualizer(QtWidgets.QMainWindow):
 
         v_qs = c_qs[cond_visible]
         v_det = np.zeros((0,3), dtype=float)
-        v_pc = np.zeros((0,3), dtype=float)
 
         if len(v_qs) == 0:
             self.plot_diff_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
@@ -1788,7 +1793,8 @@ class Visualizer(QtWidgets.QMainWindow):
             v_n = np.array([0, 0, -self.plot_det_dist]) @ TTH
             v_scale = ((v_p0 - v_l0) @ v_n) / (v_kds @ v_n)
             v_det = v_kds * v_scale[:, None] + v_l0
-            v_pc = correction_partiality_geometric(v_kds, self.ewald_rad, self.par['sfx_spectral_width'], self.par['sfx_rlp_size'])
+            v_pac = correction_partiality_geometric(v_kds, self.ewald_rad, self.par['sfx_spectral_width'], self.par['sfx_rlp_size'])
+            v_poc = PolCorFromkfs(kf=v_kds, pol_deg=self.par['polarization'])
             # plot scattering and diffracted beam vectors
             edges = np.vstack([np.zeros(len(v_det), dtype=int), np.arange(1, len(v_det)+1, 1)]).T
             nodes = np.vstack([np.array([0, 0, -self.ewald_rad]), v_det])
@@ -1797,7 +1803,7 @@ class Visualizer(QtWidgets.QMainWindow):
                 edges = np.vstack([np.zeros(len(v_qs), dtype=int), np.arange(1, len(v_qs)+1, 1)]).T
                 nodes = np.vstack([np.array([0, 0, 0]), v_qs])
                 self.plot_scat_vecs.setData(edges=edges, nodePositions=nodes)
-            return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_pc]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'pc'])
+            return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_poc, v_pac]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'poc', 'pac'])
 
     def scan_update(self):
         # Update the gui to rotate the scene objects (goniometer)
@@ -1847,20 +1853,7 @@ class Visualizer(QtWidgets.QMainWindow):
             self.scat_symm.setData(pos=list(self.scan_symm))
 
             # hkl text labels
-            for i in self.text_hkls_list:
-                i.setData(text='')
-            for i, row in _scan_data.iterrows():
-                if i >= self.par['plot_max_hkl_labels']:
-                    break
-                # calculate positionfrom hkl
-                #base = np.array(dat) @ self.OM_UC.T * 1E-10
-                base = row[['bx', 'by', 'bz']].to_numpy()
-                h, k, l = row[['h', 'k', 'l']].to_numpy(dtype=int)
-                pc = row['pc']
-                if self.gui_show_sfx_parcor.isChecked():
-                    self.text_hkls_list[i].setData(pos=base, text=f'{h} {k} {l} ({pc:.4f})')
-                else:
-                    self.text_hkls_list[i].setData(pos=base, text=f'{h} {k} {l}')
+            self.scan_add_labels(_scan_data)
 
         # update progress display
         self.gui_scan_total.setText(f'{self.hkls_num}')
@@ -1871,6 +1864,27 @@ class Visualizer(QtWidgets.QMainWindow):
         if self.scan_progress >= self.gui_scan_range.value():
             self.scan_finished()
 
+    def scan_add_labels(self, data: pd.DataFrame):
+        # Clear all labels
+        for i in range(self.par['plot_max_hkl_labels']):
+            self.list_ewald_labels[i].setData(text='')
+            self.list_detector_labels[i].setData(text='')
+        
+        # hkl text labels
+        if len(data) > 0:
+            for i, row in data.iterrows():
+                #self.list_ewald_labels[i].setData(text='')
+                #self.list_detector_labels[i].setData(text='')
+                if i >= self.par['plot_max_hkl_labels']:
+                    break
+                base = row[['bx', 'by', 'bz']].to_numpy()
+                xyz = row[['dx', 'dy', 'dz']].to_numpy()
+                h, k, l = row[['h', 'k', 'l']].to_numpy(dtype=int)
+                poc = row['poc']
+                pac = row['pac']
+                self.list_detector_labels[i].setData(pos=xyz, text=f'{h} {k} {l}\n{poc:.4f}\n{pac:.4f}')
+                self.list_ewald_labels[i].setData(pos=base, text=f'{h} {k} {l}')
+
     def scan_finished(self):
         self.scan_progress = 0
         self.scan_timer.stop()
@@ -1878,23 +1892,27 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_start_scan.setStyleSheet("background-color: #006A67")
 
         # sort data by h, k, l
-        self.scan_data = self.scan_data.sort_values(['h','k','l'], key=abs)
+        #self.scan_data = self.scan_data.sort_values(['h','k','l'], key=abs)
         # calculate d-spacings
         self.scan_data['d'] = 1 / np.linalg.norm(self.scan_data[['h','k','l']] @ self.OM_UC.T, axis=1) * 1E10
         # Add data to table
         self.gui_dat_tab.setRowCount(len(self.scan_data))
         # reset column count
-        self.gui_dat_tab.setColumnCount(5)
+        self.gui_dat_tab.setColumnCount(6)
+        # sorting while poplating causes issues
+        self.gui_dat_tab.setSortingEnabled(False)
         # fill table, all data
-        for i, row in self.scan_data.iterrows():
+        for (i, row) in self.scan_data.sort_values(['h','k','l'], key=abs).iterrows():
+            # bug here filling the table after sorting
             self.gui_dat_tab.setItem(i, 0, QtWidgets.QTableWidgetItem(str(int(row['h']))))
             self.gui_dat_tab.setItem(i, 1, QtWidgets.QTableWidgetItem(str(int(row['k']))))
             self.gui_dat_tab.setItem(i, 2, QtWidgets.QTableWidgetItem(str(int(row['l']))))
-            self.gui_dat_tab.setItem(i, 3, QtWidgets.QTableWidgetItem(str(f'{row['d']:.2f}')))
-            self.gui_dat_tab.setItem(i, 4, QtWidgets.QTableWidgetItem(str(f'{row['pc']:.4f}')))
-        # remove partiality column if not requested
-        if not self.gui_show_sfx_parcor.isChecked():
-            self.gui_dat_tab.setColumnCount(4)
+            self.gui_dat_tab.setItem(i, 3, QtWidgets.QTableWidgetItem(f'{row['d']:.2f}'))
+            self.gui_dat_tab.setItem(i, 4, QtWidgets.QTableWidgetItem(f'{row['poc']:.4f}'))
+            self.gui_dat_tab.setItem(i, 5, QtWidgets.QTableWidgetItem(f'{row['pac']:.4f}'))
+            self.gui_dat_tab.item(i, 0).setData(QtCore.Qt.ItemDataRole.UserRole, int(i))
+        # enable sorting again
+        self.gui_dat_tab.setSortingEnabled(True)
         
         # Signal GUI that scan is finished
         self.sigScanFinished.emit()
@@ -2012,8 +2030,8 @@ class Visualizer(QtWidgets.QMainWindow):
         self.scat_scan.rotate(ang3, *ax3)
         self.scat_data.rotate(ang3, *ax3)
         self.scat_symm.rotate(ang3, *ax3)
-        for i in range(self.par['plot_max_hkl_labels']):
-            self.text_hkls_list[i].rotate(ang3, *ax3)
+        for lbl in self.list_ewald_labels:
+            lbl.rotate(ang3, *ax3)
         self.plot_ax_a.rotate(ang3, *ax3)
         self.plot_ax_b.rotate(ang3, *ax3)
         self.plot_ax_c.rotate(ang3, *ax3)
@@ -2058,6 +2076,9 @@ class Visualizer(QtWidgets.QMainWindow):
             self.detector_plane.rotate(ang, *axs)
         if hasattr(self, 'detector_frame'):
             self.detector_frame.rotate(ang, *axs)
+        # Rotate the detector labels
+        for lbl in self.list_ewald_labels:
+            lbl.rotate(ang, *axs)
 
 if __name__ == '__main__':
     app = pg.mkQApp()
