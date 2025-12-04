@@ -5,7 +5,9 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
-## Version 0.0.7 (21.11.2025)
+## Version 0.0.8 (04.12.2025)
+ - Fixed the 2-Theta rotating some labels.
+ - Changed the behaviour of the hkl labels and allowed them to be toggled.
  - Added labels to the detector.
  - Added a polarisation factor.
  - Added a simple data collection strategy table.
