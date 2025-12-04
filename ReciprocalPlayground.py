@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
+import os
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
-from OpenGL.GL import glGetDoublev, GL_MODELVIEW_MATRIX, GL_PROJECTION_MATRIX
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 import numpy as np
@@ -21,7 +21,7 @@ pg.setConfigOptions(antialias=True)
 # add strategy calculation / optimization
 # unify gui checkboxes, toggle states and initializations
 
-__version__ = 'v0.0.7, 21.11.2025'
+__version__ = 'v0.0.8, 04.12.2025'
 
 def signed_angle(v1: np.ndarray, v2: np.ndarray, up_reference: np.ndarray) -> float:
         cross = np.cross(v1, v2)
@@ -166,7 +166,7 @@ class Quaternion:
         z = cr * cp * sy - sr * sp * cy
 
         return Quaternion(w, x, y, z)
-    
+
     def from_axis_rotation(axis: np.ndarray, angle: float) -> 'Quaternion':
         '''axis is a unit vector to rotate about. Angle in radians.'''
         # https://math.stackexchange.com/questions/40164/how-do-you-rotate-a-vector-by-a-unit-quaternion
@@ -174,7 +174,7 @@ class Quaternion:
         a2 = angle * 0.5
         x, y, z = axis
         return Quaternion(np.cos(a2), np.sin(a2)*x, np.sin(a2)*y, np.sin(a2)*z)
-    
+
     def random(stream: np.random.Generator) -> 'Quaternion':
         '''Generates a uniform random quaternion'''
         # https://stackoverflow.com/questions/38978441/creating-uniform-random-quaternion-and-multiplication-of-two-quaternions
@@ -411,7 +411,7 @@ def calc_angles(v1, v2):
     return np.arccos(np.sum(v1*v2, axis=1) / (np.linalg.norm(v1, axis=1)*np.linalg.norm(v2, axis=1))).reshape(-1,1)
 
 def correction_partiality_geometric(kds, ewald_radius, spectral_width=1, rlp_size=1):
-    diff_beam_2theta = calc_angles(kds, np.array([[0,0,1]]))
+    diff_beam_2theta = calc_angles(kds, np.array([[-1,0,0]]))
     diff_beam_length = np.linalg.norm(kds, axis=1).reshape(-1,1)
     corrected_spectral_width = spectral_width - spectral_width * np.cos(diff_beam_2theta)
     scale = np.sqrt(2.0 * corrected_spectral_width * rlp_size / (corrected_spectral_width**2 + rlp_size**2))
@@ -528,7 +528,8 @@ class Visualizer(QtWidgets.QMainWindow):
                     'det_pix_1':2068,
                     'det_pix_2':2162,
                     'polarization':0.99,
-                    'wavelength':0.59040E-10,# 21.0 keV
+                    'wavelength':0.7085E-10,# 21.0 keV
+                    #'wavelength':0.59040E-10,# 21.0 keV
                     #'wavelength':0.56356E-10,# 22.0 keV"
                     'ewald_offset':0.005,
                     'max_resolution':None,
@@ -591,6 +592,10 @@ class Visualizer(QtWidgets.QMainWindow):
                                                     gauss_center=(self.par['det_poni_1']/self.par['det_pix_s'],
                                                                   self.par['det_poni_2']/self.par['det_pix_s']),
                                                     seed=42)
+
+        # Reset scan progress
+        self.scan_data = pd.DataFrame(columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz'])
+        self.scan_symm = set()
 
         # Get initial orientation matrix
         self.get_orientation_matrix(self.par['sample_orientation'])
@@ -686,6 +691,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Ewald Sphere"), self.gui_show_ewald)
         # show hkls of scan data
         self.gui_show_hkls = QtWidgets.QCheckBox()
+        self.gui_show_hkls.setTristate(True)
         self.gui_show_hkls.setChecked(self.show_ewald_labels)
         self.gui_show_hkls.stateChanged.connect(self.gui_toggle_ewald_labels)
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show hkl labels"), self.gui_show_hkls)
@@ -743,6 +749,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector"), self.gui_show_detector)
         # Detector labels
         self.gui_show_detector_labels = QtWidgets.QCheckBox()
+        self.gui_show_detector_labels.setTristate(True)
         self.gui_show_detector_labels.setChecked(self.show_detector_labels)
         self.gui_show_detector_labels.stateChanged.connect(self.gui_toggle_detector_labels)
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector Labels"), self.gui_show_detector_labels)
@@ -1090,9 +1097,6 @@ class Visualizer(QtWidgets.QMainWindow):
         self.hkl_bases = self.hkls @ self.OM_UC.T * 1E-10
 
     def init_goniometer(self):
-        # Reset scan progress
-        self.scan_data = pd.DataFrame(columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz'])
-        self.scan_symm = set()
         # Update GUI
         self.gui_scan_total.setText(f'{self.hkls_num}')
         self.gui_scan_completeness.setText(f'{len(self.scan_data)/self.hkls_num*100:.0f} % ({(len(self.scan_symm)+len(self.scan_data))/self.hkls_num*100:.0f} %)')
@@ -1339,11 +1343,11 @@ class Visualizer(QtWidgets.QMainWindow):
         # hkl text labels (detector)
         self.list_detector_labels = []
         for _ in range(self.par['plot_max_hkl_labels']):
-            _text_hkls = GLWrappedTextItem(font=self.plot_fnt_hkl,
-                                           color=self.color_labl_hkls,
-                                           alignment=QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop)
-            self.gl3d.addItem(_text_hkls)
-            self.list_detector_labels.append(_text_hkls)
+            _text_det = GLWrappedTextItem(font=self.plot_fnt_hkl,
+                                          color=self.color_labl_hkls,
+                                          alignment=QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop)
+            self.gl3d.addItem(_text_det)
+            self.list_detector_labels.append(_text_det)
 
         # Initial toggle states
         self.gui_toggle_ewald_labels(self.show_ewald_labels)
@@ -1518,9 +1522,6 @@ class Visualizer(QtWidgets.QMainWindow):
         #self.detector_plane.translate(*_translate)
         #self.gl3d.addItem(self.detector_plane)
 
-        #import h5py
-        #with h5py.File('/Users/au577597/Library/CloudStorage/OneDrive-Aarhusuniversitet/Github/ReciprocalPlayground/SFX/1334180_compact.h5', 'r') as h5f:
-        #    img_data = h5f['/entry/instrument/detector/detector_data'][0,:,:]
         RGBA, has_alpha = pg.makeARGB(self.det_img_data, lut=pg.colormap.get('viridis').getLookupTable(0.0, 1.0, 64), levels=(0, 100))
         self.detector_plane = gl.GLImageItem(RGBA)
         self.detector_plane.setDepthValue(-1)
@@ -1624,11 +1625,13 @@ class Visualizer(QtWidgets.QMainWindow):
         self.show_ewald_labels = state
         for txt in self.list_ewald_labels:
             txt.setVisible(self.show_ewald_labels)
+        self.scan_add_labels(self.scan_data)
     
     def gui_toggle_detector_labels(self, state):
         self.show_detector_labels = state
         for txt in self.list_detector_labels:
             txt.setVisible(self.show_detector_labels)
+        self.scan_add_labels(self.scan_data)
 
     def gui_toggle_ewald_sphere(self, state):
         self.show_ewald = state
@@ -1712,11 +1715,56 @@ class Visualizer(QtWidgets.QMainWindow):
         # Make random orientation matrix
         if OM is None:
             ang1, ang2, ang3 = np.random.rand(3)
+        elif OM == 'custom':
+            self.OM = self.read_SACLA_OM()
+            return
         else:
             ang1, ang2, ang3 = np.zeros(3)
         self.OM = Quaternion.from_axis_rotation(np.array([1, 0, 0]), ang1) * \
                   Quaternion.from_axis_rotation(np.array([0, 1, 0]), ang2) * \
                   Quaternion.from_axis_rotation(np.array([0, 0, 1]), ang3)
+
+    def read_SACLA_OM(self):
+        import h5py
+        my_path = '/Users/au577597/Library/CloudStorage/OneDrive-Aarhusuniversitet/Github/ReciprocalPlayground/SFX/'
+        with open(os.path.join(my_path, 'OM.txt'), 'r') as f:
+            taglist = f.readlines()
+        #tagdict = {i[0]: np.array(i[-9:]).astype(float).reshape((3,3)) for i in [j.split() for j in taglist]}
+        tagdict = {i[0]: np.array(i[-9:]).astype(float) for i in [j.split() for j in taglist]}
+        print(tagdict)
+        
+        UC = matrix_from_cell([self.par['sample_cell_a'],
+                               self.par['sample_cell_b'],
+                               self.par['sample_cell_c'],
+                               self.par['sample_cell_alpha'],
+                               self.par['sample_cell_beta'],
+                               self.par['sample_cell_gamma']])
+        print(UC)
+        _ = (tagdict['000000023'].reshape(-3,3) @ np.linalg.inv(UC))
+        print(_)
+        m00, m01, m02, m10, m11, m12, m20, m21, m22 = _.flatten()
+        if (m22 < 0):
+            if (m00 > m11):
+                t = 1 + m00 -m11 -m22
+                q = Quaternion( t, m01+m10, m20+m02, m12-m21 )
+            else:
+                t = 1 -m00 + m11 -m22
+                q = Quaternion( m01+m10, t, m12+m21, m20-m02 )
+        else:
+            if (m00 < -m11):
+                t = 1 -m00 -m11 + m22
+                q = Quaternion( m20+m02, m12+m21, t, m01-m10 )
+            else:
+                t = 1 + m00 + m11 + m22
+                q = Quaternion( m12-m21, m20-m02, m01-m10, t )
+        q *= 0.5 / np.sqrt(t)
+        print(q)
+
+        with h5py.File(os.path.join(my_path, '1334180_compact.h5'), 'r') as h5f:
+            img_tags = h5f['/entry/instrument/detector/tagnumbers'][()]
+            self.det_img_data = h5f['/entry/instrument/detector/detector_data'][0,:,:]
+        self.plot_add_detector()
+        return q
 
     def restart_new_cell(self):
         # get new parameters from GUI
@@ -1795,6 +1843,7 @@ class Visualizer(QtWidgets.QMainWindow):
             v_det = v_kds * v_scale[:, None] + v_l0
             v_pac = correction_partiality_geometric(v_kds, self.ewald_rad, self.par['sfx_spectral_width'], self.par['sfx_rlp_size'])
             v_poc = PolCorFromkfs(kf=v_kds, pol_deg=self.par['polarization'])
+            v_tth = calc_angles(v_kds, np.array([[0,0,1]]))
             # plot scattering and diffracted beam vectors
             edges = np.vstack([np.zeros(len(v_det), dtype=int), np.arange(1, len(v_det)+1, 1)]).T
             nodes = np.vstack([np.array([0, 0, -self.ewald_rad]), v_det])
@@ -1803,7 +1852,7 @@ class Visualizer(QtWidgets.QMainWindow):
                 edges = np.vstack([np.zeros(len(v_qs), dtype=int), np.arange(1, len(v_qs)+1, 1)]).T
                 nodes = np.vstack([np.array([0, 0, 0]), v_qs])
                 self.plot_scat_vecs.setData(edges=edges, nodePositions=nodes)
-            return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_poc, v_pac]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'poc', 'pac'])
+            return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_tth, v_poc, v_pac]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'tth', 'poc', 'pac'])
 
     def scan_update(self):
         # Update the gui to rotate the scene objects (goniometer)
@@ -1864,7 +1913,7 @@ class Visualizer(QtWidgets.QMainWindow):
         if self.scan_progress >= self.gui_scan_range.value():
             self.scan_finished()
 
-    def scan_add_labels(self, data: pd.DataFrame):
+    def scan_add_labels(self, data:pd.DataFrame):
         # Clear all labels
         for i in range(self.par['plot_max_hkl_labels']):
             self.list_ewald_labels[i].setData(text='')
@@ -1882,8 +1931,15 @@ class Visualizer(QtWidgets.QMainWindow):
                 h, k, l = row[['h', 'k', 'l']].to_numpy(dtype=int)
                 poc = row['poc']
                 pac = row['pac']
-                self.list_detector_labels[i].setData(pos=xyz, text=f'{h} {k} {l}\n{poc:.4f}\n{pac:.4f}')
-                self.list_ewald_labels[i].setData(pos=base, text=f'{h} {k} {l}')
+                tth = np.rad2deg(row['tth'])
+                if self.gui_show_detector_labels.checkState() == QtCore.Qt.CheckState.PartiallyChecked:
+                    self.list_detector_labels[i].setData(pos=xyz, text=f'{h} {k} {l}')
+                else:
+                    self.list_detector_labels[i].setData(pos=xyz, text=f'{h} {k} {l}\n\u03b8 {tth:.4f}\n\u29b9 {poc:.4f}\n\u2202 {pac:.4f}')
+                if self.gui_show_hkls.checkState() == QtCore.Qt.CheckState.PartiallyChecked:
+                    self.list_ewald_labels[i].setData(pos=base, text=f'{h} {k} {l}')
+                else:
+                    self.list_ewald_labels[i].setData(pos=base, text=f'{h} {k} {l}\n\u03b8 {tth:.4f}\n\u29b9 {poc:.4f}\n\u2202 {pac:.4f}')
 
     def scan_finished(self):
         self.scan_progress = 0
@@ -2076,9 +2132,6 @@ class Visualizer(QtWidgets.QMainWindow):
             self.detector_plane.rotate(ang, *axs)
         if hasattr(self, 'detector_frame'):
             self.detector_frame.rotate(ang, *axs)
-        # Rotate the detector labels
-        for lbl in self.list_ewald_labels:
-            lbl.rotate(ang, *axs)
 
 if __name__ == '__main__':
     app = pg.mkQApp()
