@@ -11,6 +11,36 @@ import sympy
 import re
 pg.setConfigOptions(antialias=True)
 
+gl.shaders.Shaders.append(gl.shaders.ShaderProgram('balloon_glow', 
+    [   
+        gl.shaders.VertexShader("""
+                uniform mat4 u_mvp;
+                uniform mat3 u_normal;
+                attribute vec4 a_position;
+                attribute vec3 a_normal;
+                attribute vec4 a_color;
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    v_normal = normalize(u_normal * a_normal);
+                    v_color = a_color;
+                    gl_Position = u_mvp * a_position;
+                }
+            """),
+    gl.shaders.FragmentShader("""
+                #ifdef GL_ES
+                precision mediump float;
+                #endif
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    vec4 color = v_color;
+                    color.w = min(color.w + 4.0 * color.w * pow(v_normal.x*v_normal.x + v_normal.y*v_normal.y, 20.0), 1.0);
+                    gl_FragColor = color;
+                }
+            """)
+    ]))
+
 # ideas
 # front culling of ewald sphere and reciprocal lattice points
 # add detector axes, poni, distance (modules?)
@@ -648,9 +678,11 @@ class Visualizer(QtWidgets.QMainWindow):
         self.plot_line_width = 1
         self.plot_line_width_medium = 2
         self.plot_line_width_thick = 4
+        self.plot_scat_rlatt_size = 0.02
+        self.plot_scat_point_size = 0.02
 
         # Colorsself.color_scat_latt
-        self.color_scat_latt = QtGui.QColor(80, 80, 80, 50)
+        self.color_scat_latt = QtGui.QColor(100, 100, 100, 100)
         self.color_scat_symm = QtGui.QColor(111, 164, 175, 200)
         self.color_scat_data = QtGui.QColor(129, 24, 68, 200)
         self.color_scat_scan = QtGui.QColor(245, 173, 24, 200)
@@ -893,7 +925,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_show_cell = QtWidgets.QCheckBox()
         self.gui_show_cell.setChecked(self.show_cell_outline)
         self.gui_show_cell.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_cell_outline', self.plot_cell))
-        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Unit Cell"), self.gui_show_cell)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Reciprocal Cell"), self.gui_show_cell)
         # Crystal
         self.gui_show_cryst = QtWidgets.QCheckBox()
         self.gui_show_cryst.setChecked(self.show_crystal)
@@ -922,6 +954,26 @@ class Visualizer(QtWidgets.QMainWindow):
         self.gui_show_detector_labels.setCheckState(self.show_detector_labels)
         self.gui_show_detector_labels.stateChanged.connect(self.gui_toggle_detector_labels)
         self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector Labels"), self.gui_show_detector_labels)
+        # Reciprocal lattice alpha
+        self.gui_rlatt_alpha = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_rlatt_alpha.setMinimum(0.01)
+        self.gui_rlatt_alpha.setMaximum(1)
+        self.gui_rlatt_alpha.setDecimals(2)
+        self.gui_rlatt_alpha.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_rlatt_alpha.setSingleStep(0.01)
+        self.gui_rlatt_alpha.setValue(self.color_scat_latt.alphaF())
+        self.gui_rlatt_alpha.valueChanged.connect(self.gui_set_rlatt_alpha)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("RLATT Alpha"), self.gui_rlatt_alpha)
+        # Reciprocal lattice size
+        self.gui_rlatt_size = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_rlatt_size.setMinimum(0.001)
+        self.gui_rlatt_size.setMaximum(1)
+        self.gui_rlatt_size.setDecimals(3)
+        self.gui_rlatt_size.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_rlatt_size.setSingleStep(0.001)
+        self.gui_rlatt_size.setValue(self.plot_scat_rlatt_size)
+        self.gui_rlatt_size.valueChanged.connect(self.gui_set_rlatt_size)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("RLATT Size"), self.gui_rlatt_size)
 
         # Experimental Information
         self.box_sample_layout = self.add_dock_widget("Experimental")
@@ -1247,6 +1299,15 @@ class Visualizer(QtWidgets.QMainWindow):
         # Set minimum width of parameter scroll area to fit all unfolded parameters
         self.parameter_scroll.setMinimumWidth(self.parameter_box.sizeHint().width() + 20)
 
+    def gui_set_rlatt_size(self, value):
+        self.scat_latt.setData(size=value)
+        self.plot_scat_rlatt_size = value
+
+    def gui_set_rlatt_alpha(self, value):
+        self.color_scat_latt.setAlphaF(value)
+        self.scat_latt.setData(color=self.color_scat_latt)
+        self.plot_scat_rlatt_alpha = value
+
     def data_table_selection_changed(self):
         rows = [i.data(QtCore.Qt.ItemDataRole.UserRole) for i in self.gui_dat_tab.selectedItems() if i.column() == 0]
         self.scan_add_labels(self.scan_data.loc[rows])
@@ -1308,7 +1369,7 @@ class Visualizer(QtWidgets.QMainWindow):
         self.plot_add_detector()
 
         # Scattering pattern on detector
-        self.scat_pattern = gl.GLScatterPlotItem(size=max(self.plot_det_dist/50, 0.25),
+        self.scat_pattern = gl.GLScatterPlotItem(size=max(self.plot_det_dist/50, 0.2),
                                                  color=self.color_scat_patt,
                                                  pxMode=False)
         self.gl3d.addItem(self.scat_pattern, center=True)
@@ -1413,27 +1474,28 @@ class Visualizer(QtWidgets.QMainWindow):
         #################
         # Reciprocal lattice points
         self.scat_latt = gl.GLScatterPlotItem(pos=self.hkl_bases,
-                                              size=0.05,
+                                              size=self.plot_scat_rlatt_size,
                                               color=self.color_scat_latt,
                                               pxMode=False)
         self.gl3d.addItem(self.scat_latt)
         
         # Symmetry equivalents
-        self.scat_symm = gl.GLScatterPlotItem(size=0.075,
+        self.scat_symm = gl.GLScatterPlotItem(size=self.plot_scat_point_size,
                                               color=self.color_scat_symm,
                                               pxMode=False)
         self.gl3d.addItem(self.scat_symm)
         
         # Collected data points
-        self.scat_data = gl.GLScatterPlotItem(size=0.075,
+        self.scat_data = gl.GLScatterPlotItem(size=self.plot_scat_point_size,
                                               color=self.color_scat_data,
                                               pxMode=False)
         self.gl3d.addItem(self.scat_data)
 
         # Scanned RLP
-        self.scat_scan = gl.GLScatterPlotItem(size=0.075,
+        self.scat_scan = gl.GLScatterPlotItem(size=self.plot_scat_point_size,
                                               color=self.color_scat_scan,
-                                              pxMode=False)
+                                              pxMode=False,
+                                              glOptions='opaque')
         self.gl3d.addItem(self.scat_scan, center=True)
 
         """
@@ -1493,7 +1555,7 @@ class Visualizer(QtWidgets.QMainWindow):
                                           drawFaces=True,
                                           edgeColor=(1,1,1,1),
                                           #faceColors=np.array([0.55, 0.75, 1.0, 0.95], dtype=np.float32),
-                                          shader='edgeHilight',
+                                          shader='balloon',
                                           polygonOffset=True,
                                           )
         self.crystal_mesh.setGLOptions('translucent')
@@ -1551,14 +1613,15 @@ class Visualizer(QtWidgets.QMainWindow):
 
         self.ewald_sphere = gl.GLMeshItem()
         self.ewald_sphere.setMeshData(drawEdges=False,
-                                      smooth=True,
-                                      shader='balloon',
+                                      smooth=False,
+                                      shader='balloon_glow',
                                       meshdata=gl.MeshData.sphere(rows=100,
                                                                   cols=100,
                                                                   radius=self.ewald_rad))
         self.ewald_sphere.translate(0, 0, -self.ewald_rad)
         self.ewald_sphere.setGLOptions('translucent')
         self.ewald_sphere.setColor((0.2, 0.4, 0.6, 0.2))
+
         self.gl3d.addItem(self.ewald_sphere)
         # Ewald sphere outline ab
         self.ewald_outline_ab = gl.GLLinePlotItem()
@@ -1761,7 +1824,7 @@ class Visualizer(QtWidgets.QMainWindow):
         #self.detector_plane.translate(*_translate)
         #self.gl3d.addItem(self.detector_plane)
 
-        RGBA, has_alpha = pg.makeARGB(self.det_img_data, lut=pg.colormap.get('viridis').getLookupTable(0.0, 1.0, 64), levels=(0, 100))
+        RGBA, has_alpha = pg.makeARGB(self.det_img_data, lut=pg.colormap.get('viridis').getLookupTable(0.0, 1.0, 128), levels=(0, 100))
         self.detector_plane = gl.GLImageItem(RGBA)
         self.detector_plane.setDepthValue(-1)
         self.detector_plane.scale(det_hor_full/RGBA.shape[0], det_ver_full/RGBA.shape[1], 1)
