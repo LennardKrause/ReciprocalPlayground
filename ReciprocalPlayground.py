@@ -54,7 +54,7 @@ gl.shaders.Shaders.append(gl.shaders.ShaderProgram('balloon_glow',
 # unify gui checkboxes, toggle states and initializations
 # Add a maximum resolution cone
 
-__version__ = 'v0.1.0, 22.10.2026'
+__version__ = 'v0.1.1, 24.10.2026'
 
 def signed_angle(v1: np.ndarray, v2: np.ndarray, up_reference: np.ndarray) -> float:
         cross = np.cross(v1, v2)
