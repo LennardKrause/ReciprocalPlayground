@@ -5,6 +5,9 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
+## Version 0.1.1 (24.10.2026)
+ - Change reciprocal lattice point size and alpha channel from gui.
+ - Option to fix orientation matrix.
 ## Version 0.1.0 (22.10.2026)
  - Mainly fixing bugs and leaving the program in a better state as I've hopefully introduced less new bugs than were before!
  - You can right-click a spot currently in diffraction condition to set the center of rotation.
