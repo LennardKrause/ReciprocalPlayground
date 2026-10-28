@@ -5,6 +5,12 @@
  - understand the reciprocal space
  - teach single crystal X-ray diffraction
 
+>[!NOTE]
+>To install check the [releases page](https://github.com/LennardKrause/ReciprocalPlayground/releases), download the latest *.whl and install using pip.<br>
+>```python3 -m pip install reciprocalplayground-1.0.0-py3-none-any.whl```
+
+## Version 1.0.0 (28.10.2026)
+ - First release candidate
 ## Version 0.1.1 (24.10.2026)
  - Change reciprocal lattice point size and alpha channel from gui.
  - Option to fix orientation matrix.
