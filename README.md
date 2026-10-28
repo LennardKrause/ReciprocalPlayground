@@ -6,7 +6,7 @@
  - teach single crystal X-ray diffraction
 
 >[!NOTE]
->To install check the [releases page](https://github.com/LennardKrause/ReciprocalPlayground/releases), download the latest *.whl and install using pip.<br>
+>Check the [releases page](https://github.com/LennardKrause/ReciprocalPlayground/releases), download the latest *.whl and install it using pip.<br>
 >```python3 -m pip install reciprocalplayground-1.0.0-py3-none-any.whl```
 
 ## Version 1.0.0 (28.10.2026)
