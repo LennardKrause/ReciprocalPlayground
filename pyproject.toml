@@ -1,0 +1,31 @@
+[project]
+name = "ReciprocalPlayground"
+dynamic = ["version"]
+authors = [
+  { name="Lennard Krause", email="lkrause@chem.au.dk" },
+]
+description = "A tool to explore diffraction geometry, understand the reciprocal space and teach single-crystal X-ray diffraction"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy >= 1.26",
+                "pyqtgraph >= 0.14",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License (GPL)",
+    "Operating System :: OS Independent",
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Education",
+    "Topic :: Scientific/Engineering",
+]
+
+[tool.setuptools.dynamic]
+version = {attr = "rcppg.__version__"}
+
+[project.urls]
+"Homepage" = "https://github.com/LennardKrause/ReciprocalPlayground"
+
+[project.scripts]
+rcppg = "rcppg.run_rcppg:main"
+ReciprocalPlayground = "rcppg.run_rcppg:main"

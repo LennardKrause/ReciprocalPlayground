@@ -1,0 +1,1868 @@
+import os
+import numpy as np
+import pandas as pd
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+import pyqtgraph.opengl as gl
+pg.setConfigOptions(antialias=True)
+
+import rcppg.shaders
+from rcppg.utility import (GLWrappedTextItem,
+                           CenterGLViewWidget,
+                           Quaternion,
+                           matrix_from_cell,
+                           get_sym_mat_from_coords,
+                           calc_hkls,
+                           correction_partiality_geometric,
+                           calc_angles,
+                           PolCorFromkfs)
+
+# ideas
+# front culling of ewald sphere and reciprocal lattice points
+# add detector axes, poni, distance (modules?)
+# read h5 files from sfx experiments
+#  - simulate sfx patterns from given hkls and crystal orientation distribution
+#  - implement rocking curve simulation (partiality)
+
+# todo
+# gui toggles behave erratically
+# add strategy calculation / optimization
+# unify gui checkboxes, toggle states and initializations
+# Add a maximum resolution cone
+
+class ReciprocalPlayground(QtWidgets.QMainWindow):
+    sigKeyPress = QtCore.pyqtSignal(object)
+    sigScanFinished = QtCore.pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setWindowTitle(f'Reciprocal Playground {rcppg.__version__} (released {rcppg.__date__})')
+        central_widget = QtWidgets.QSplitter()
+        central_widget.setHandleWidth(10)
+        self.setCentralWidget(central_widget)
+        self.sigKeyPress.connect(self.keyPressEvent)
+
+        self.parameter_scroll = QtWidgets.QScrollArea()
+        self.parameter_scroll.setContentsMargins(0,0,0,0)
+        #self.parameter_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        #self.parameter_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.parameter_scroll.setWidgetResizable(True)
+        central_widget.addWidget(self.parameter_scroll)
+        self.parameter_box = QtWidgets.QFrame()
+        self.params_layout = QtWidgets.QVBoxLayout()
+        self.params_layout.setSpacing(0)
+        self.params_layout.setContentsMargins(10,0,0,0)
+        self.params_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        self.parameter_box.setLayout(self.params_layout)
+        self.parameter_scroll.setWidget(self.parameter_box)
+
+        #self.gl3d = gl.GLViewWidget()
+        self.gl3d = CenterGLViewWidget()
+        self.gl3d.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.gl3d.setBackgroundColor((10, 20, 20))
+        central_widget.addWidget(self.gl3d)
+
+        self.orth_proj = False
+        self.show_cell_axs = True
+        self.show_cell_axs_lbl = True
+        self.show_gon_axs = True
+        self.show_gon_axs_lbl = True
+        self.show_cell_outline = True
+        self.show_crystal = True
+        self.show_detector = True
+        self.show_ewald = True
+        self.show_ewald_labels = QtCore.Qt.CheckState.PartiallyChecked
+        self.show_maxres = True
+
+        self.show_detector_labels = QtCore.Qt.CheckState.Unchecked
+        self.show_scat_vecs = True
+        self.show_diff_vecs = True
+        self.show_scat_latt = True
+        self.show_scat_scan = True
+        self.show_scat_data = False
+        self.show_scat_symm = False
+        
+        # SFX
+        self.sfx_keep_all_data = False
+        #self.show_sfx_parcor = False
+
+        #self.setGeometry(0, 0, 1920, 1080)
+        self.setGeometry(500, 0, 1280, 768)
+        self.plot_fnt_tab = QtGui.QFont('Helvetica', 14)
+        self.plot_fnt_lbl = QtGui.QFont('Helvetica', 18)
+        self.plot_fnt_hkl = QtGui.QFont('Helvetica', 18)
+        self.plot_line_width = 1
+        self.plot_line_width_medium = 2
+        self.plot_line_width_thick = 4
+        self.plot_scat_rlatt_size = 0.02
+        self.plot_scat_point_size = 0.02
+
+        # Colorsself.color_scat_latt
+        self.color_scat_latt = QtGui.QColor(100, 100, 100, 100)
+        self.color_scat_symm = QtGui.QColor(111, 164, 175, 200)
+        self.color_scat_data = QtGui.QColor(129, 24, 68, 200)
+        self.color_scat_scan = QtGui.QColor(245, 173, 24, 200)
+        self.color_labl_hkls = QtGui.QColor(255, 255, 255, 255)
+        #self.color_labl_hkls = QtGui.QColor(255, 0, 96, 255)
+        self.color_scat_vecs = QtGui.QColor(245, 173, 24, 200)
+        self.color_diff_vecs = QtGui.QColor(255, 0, 96, 200)
+        self.color_detector = QtGui.QColor(128, 128, 128, 128)
+        self.color_scat_patt = QtGui.QColor(200, 200, 200, 200)
+        self.color_gui_buttons = QtGui.QColor(0, 106, 103, 255)
+
+        # Default parameters
+        self.par = {'sample_cell_a':6.0,
+                    'sample_cell_b':7.0,
+                    'sample_cell_c':8.0,
+                    'sample_cell_alpha':90.0,
+                    'sample_cell_beta':90.0,
+                    'sample_cell_gamma':90.0,
+                    'sample_point_group':'-1',
+                    'sample_random_om':True,
+                    'det_poni_1':None,
+                    'det_poni_2':None,
+                    'det_distance':0.15,
+                    'det_pix_s':75.0E-6,
+                    'det_pix_1':2068,
+                    'det_pix_2':2162,
+                    'polarization':0.97,
+                    #'wavelength':0.7085E-10,# 21.0 keV
+                    'wavelength':0.59040E-10,# 21.0 keV
+                    #'wavelength':0.56356E-10,# 22.0 keV"
+                    'ewald_offset':0.005,
+                    'max_resolution':None,
+                    'scan_axis':'Omega',
+                    'scan_step':0.01,
+                    'scan_range':180,
+                    'scan_speed':1,
+                    'gon_phi_axs':np.array([1,0,0]),
+                    'gon_chi_axs':np.array([0,0,1]),
+                    'gon_omg_axs':np.array([1,0,0]),
+                    'gon_tth_axs':np.array([1,0,0]),
+                    'gon_ttv_axs':np.array([0,1,0]),
+                    'gon_tth_ang':0.0,
+                    'gon_omg_ang':0.0,
+                    'gon_chi_ang':0.0,
+                    'gon_phi_ang':0.0,
+                    'plot_max_hkl_labels':100,
+                    'sfx_spectral_width':None,
+                    'sfx_rlp_size':None,}
+
+        # Data collection strategy
+        #  - omg, chi, phi, width, range
+        self.dc_strat = [(  0,   0,   0, 0.5, 180),
+                         (  0,  24,   0, 0.5, 180),
+                         (  0,  48,   0, 0.5, 180),
+                         (  0,  48, 120, 0.5, 180),
+                         (  0,  48, 240, 0.5, 180)]
+
+        # Set camera
+        #self.gl3d.setCameraParams(distance=75000, fov=60, elevation=-45, azimuth=0)
+        self.gl3d.setCameraParams(distance=75000, fov=60, elevation=-45, azimuth=0)
+        self.gui_set_projection(toggle=self.orth_proj)
+        # Set plot detector distance
+        # Graphical glitch when getting too close
+        # Scattering pattern is misaligned and reaches
+        # out further than the detector
+        self.plot_det_dist = 100
+        self.look_along_option = 1
+
+        if self.par['max_resolution'] is None:
+            self.par['max_resolution'] = self.par['wavelength'] / 2
+            
+        # Set default poni to center of detector if None
+        if self.par['det_poni_1'] is None:
+            self.par['det_poni_1'] = self.par['det_pix_1'] * self.par['det_pix_s'] / 2
+        if self.par['det_poni_2'] is None:
+            self.par['det_poni_2'] = self.par['det_pix_2'] * self.par['det_pix_s'] / 2
+        if self.par['sfx_spectral_width'] is None:
+            self.par['sfx_spectral_width'] = 2 * self.par['ewald_offset']
+        if self.par['sfx_rlp_size'] is None:
+            self.par['sfx_rlp_size'] = 2 * self.par['ewald_offset']
+
+        # Placeholder detector image
+        self.det_img_data = self.gui_detector_image(shape=(self.par['det_pix_1'],
+                                                           self.par['det_pix_2']),
+                                                    background_level=0.0,
+                                                    noise_sigma=1.0,
+                                                    gauss_amp=50.0,
+                                                    gauss_sigma=250.0,
+                                                    gauss_center=(self.par['det_poni_1']/self.par['det_pix_s'],
+                                                                  self.par['det_poni_2']/self.par['det_pix_s']),
+                                                    seed=42)
+
+        # Reset scan progress
+        self.scan_data = pd.DataFrame(columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz'])
+        self.scan_symm = set()
+
+        # Get initial orientation matrix
+        self.get_orientation_matrix(self.par['sample_random_om'])
+
+        # symmetry operations
+        self.sym_dict = {'1': '(x,y,z)',
+                         '-1': '(x,y,z)(-x,-y,-z)',
+                         '2': '(x,y,z)(-x,y,-z)',
+                         'm': '(x,y,z)(x,-y,z)',
+                         '2/m': '(x,y,z)(-x,y,-z)(-x,-y,-z)(x,-y,z)',
+                         '222': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)',
+                         'mm2': '(x,y,z)(-x,-y,z)(x,-y,z)(-x,y,z)',
+                         'mmm': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)(-x,-y,-z)(x,y,-z)(x,-y,z)(-x,y,z)',
+                         '4': '(x,y,z)(-x,-y,z)(-y,x,z)(y,-x,z)',
+                         '-4': '(x,y,z)(-x,-y,z)(y,-x,-z)(-y,x,-z)',
+                         '4/m': '(x,y,z)(-x,-y,z)(-y,x,z)(y,-x,z)(-x,-y,-z)(x,y,-z)(y,-x,-z)(-y,x,-z)',
+                         '422': '(x,y,z)(-x,-y,z)(-y,x,z)(y,-x,z)(-x,y,-z)(x,-y,-z)(y,x,-z)(-y,-x,-z)',
+                         '4mm': '(x,y,z)(-x,-y,z)(-y,x,z)(y,-x,z)(x,-y,z)(-x,y,z)(-y,-x,z)(y,x,z)',
+                         '-42m': '(x,y,z)(-x,-y,z)(y,-x,-z)(-y,x,-z)(-x,y,-z)(x,-y,-z)(-y,-x,z)(y,x,z)',
+                         '4/mmm': '(x,y,z)(-x,-y,z)(-y,x,z)(y,-x,z)(-x,y,-z)(x,-y,-z)(y,x,-z)(-y,-x,-z)(-x,-y,-z)(x,y,-z)(y,-x,-z)(-y,x,-z)(x,-y,z)(-x,y,z)(-y,-x,z)(y,x,z)',
+                         '3': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)',
+                         '-3': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-x,-y,-z)(y,-x+y,-z)(x-y,x,-z)',
+                         '32': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-y,-x,-z)(-x+y,y,-z)(x,x-y,-z)',
+                         '32(321)': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(y,x,-z)(x-y,-y,-z)(-x,-x+y,-z)',
+                         '3m': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-y,-x,z)(-x+y,y,z)(x,x-y,z)',
+                         '3m(31m': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(y,x,z)(x-y,-y,z)(-x,-x+y,z)',
+                         '-3m': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-y,-x,-z)(-x+y,y,-z)(x,x-y,-z)(-x,-y,-z)(y,-x+y,-z)(x-y,x,-z)(y,x,z)(x-y,-y,z)(-x,-x+y,z)',
+                         '-3m1':'(x,y,z)(-y,x-y,z)(-x+y,-x,z)(y,x,-z)(x-y,-y,-z)(-x,-x+y,-z)(-x,-y,-z)(y,-x+y,-z)(x-y,x,-z)(-y,-x,z)(-x+y,y,z)(x,x-y,z)',
+                         '6': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-x,-y,z)(y,-x+y,z)(x-y,x,z)',
+                         '-6': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(x,y,-z)(-y,x-y,-z)(-x+y,-x,-z)',
+                         '6/m': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-x,-y,z)(y,-x+y,z)(x-y,x,z)(-x,-y,-z)(y,-x+y,-z)(x-y,x,-z)(x,y,-z)(-y,x-y,-z)(-x+y,-x,-z)' ,
+                         '622': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-x,-y,z)(y,-x+y,z)(x-y,x,z)(y,x,-z)(x-y,-y,-z)(-x,-x+y,-z)(-y,-x,-z)(-x+y,y,-z)(x,x-y,-z)',
+                         '6mm': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-x,-y,z)(y,-x+y,z)(x-y,x,z)(-y,-x,z)(-x+y,y,z)(x,x-y,z)(y,x,z)(x-y,-y,z)(-x,-x+y,z)',
+                         '-6m2': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(x,y,-z)(-y,x-y,-z)(-x+y,-x,-z)(-y,-x,z)(-x+y,y,z)(x,x-y,z)(-y,-x,-z)(-x+y,y,-z)(x,x-y,-z)',
+                         '-6m2(-62m)': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(x,y,-z)(-y,x-y,-z)(-x+y,-x,-z)(y,x,-z)(x-y,-y,-z)(-x,-x+y,-z)(y,x,z)(x-y,-y,z)(-x,-x+y,z)',
+                         '6/mmm': '(x,y,z)(-y,x-y,z)(-x+y,-x,z)(-x,-y,z)(y,-x+y,z)(x-y,x,z)(y,x,-z)(x-y,-y,-z)(-x,-x+y,-z)(-y,-x,-z)(-x+y,y,-z)(x,x-y,-z)(-x,-y,-z)(y,-x+y,-z)(x-y,x,-z)(x,y,-z)(-y,x-y,-z)(-x+y,-x,-z)(-y,-x,z)(-x+y,y,z)(x,x-y,z)(y,x,z)(x-y,-y,z)(-x,-x+y,z)',
+                         '23': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)(z,x,y)(z,-x,-y)(-z,-x,y)(-z,x,-y)(y,z,x)(-y,z,-x)(y,-z,-x)(-y,-z,x)',
+                         'm-3': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)(z,x,y)(z,-x,-y)(-z,-x,y)(-z,x,-y)(y,z,x)(-y,z,-x)(y,-z,-x)(-y,-z,x)(-x,-y,-z)(x,y,-z)(x,-y,z)(-x,y,z)(-z,-x,-y)(-z,x,y)(z,x,-y)(z,-x,y)(-y,-z,-x)(y,-z,x)(-y,z,x)(y,z,-x)',
+                         '432': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)(z,x,y)(z,-x,-y)(-z,-x,y)(-z,x,-y)(y,z,x)(-y,z,-x)(y,-z,-x)(-y,-z,x)(y,x,-z)(-y,-x,-z)(y,-x,z)(-y,x,z)(x,z,-y)(-x,z,y)(-x,-z,-y)(x,-z,y)(z,y,-x)(z,-y,x)(-z,y,x)(-z,-y,-x)',
+                         '-43m': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)(z,x,y)(z,-x,-y)(-z,-x,y)(-z,x,-y)(y,z,x)(-y,z,-x)(y,-z,-x)(-y,-z,x)(y,x,z)(-y,-x,z)(y,-x,-z)(-y,x,-z)(x,z,y)(-x,z,-y)(-x,-z,y)(x,-z,-y)(z,y,x)(z,-y,-x)(-z,y,-x)(-z,-y,x)',
+                         'm-3m': '(x,y,z)(-x,-y,z)(-x,y,-z)(x,-y,-z)(z,x,y)(z,-x,-y)(-z,-x,y)(-z,x,-y)(y,z,x)(-y,z,-x)(y,-z,-x)(-y,-z,x)(y,x,-z)(-y,-x,-z)(y,-x,z)(-y,x,z)(x,z,-y)(-x,z,y)(-x,-z,-y)(x,-z,y)(z,y,-x)(z,-y,x)(-z,y,x)(-z,-y,-x)(-x,-y,-z)(x,y,-z)(x,-y,z)(-x,y,z)(-z,-x,-y)(-z,x,y)(z,x,-y)(z,-x,y)(-y,-z,-x)(y,-z,x)(-y,z,x)(y,z,-x)(-y,-x,z)(y,x,z)(-y,x,-z)(y,-x,-z)(-x,-z,y)(x,-z,-y)(x,z,y)(-x,z,-y)(-z,-y,x)(-z,y,-x)(z,-y,-x)(z,y,x)'
+                         }
+        #self.get_sym_ops()
+        
+        # init goniometer rotation
+        self.gon_rot_ax3 = Quaternion.from_axis_rotation(self.par['gon_phi_axs'], np.deg2rad(self.par['gon_phi_ang'])) * \
+                           Quaternion.from_axis_rotation(self.par['gon_chi_axs'], np.deg2rad(self.par['gon_chi_ang'])) * \
+                           Quaternion.from_axis_rotation(self.par['gon_omg_axs'], np.deg2rad(self.par['gon_omg_ang']))
+        self.gon_rot_ax2 = Quaternion.from_axis_rotation(self.par['gon_chi_axs'], np.deg2rad(self.par['gon_chi_ang'])) * \
+                           Quaternion.from_axis_rotation(self.par['gon_omg_axs'], np.deg2rad(self.par['gon_omg_ang']))
+        self.gon_rot_ax1 = Quaternion.from_axis_rotation(self.par['gon_omg_axs'], np.deg2rad(self.par['gon_omg_ang']))
+        self.gon_rot_tth = Quaternion.from_axis_rotation(self.par['gon_tth_axs'], np.deg2rad(self.par['gon_tth_ang']))
+
+        self.scan_timer = QtCore.QTimer()
+        self.scan_timer.timeout.connect(self.scan_update)
+        
+        # run inits
+        self.init_gui()
+        self.init_gui_parameters()
+        self.init_plot()
+        self.init_goniometer()
+
+        self.set_toggle_states()
+
+        # Collapse all widgets
+        for widget in self.parameter_box.children():
+            if isinstance(widget, QtWidgets.QPushButton):
+                widget.click()
+
+    def set_toggle_states(self):
+        # Set initial visibility of scattering objects
+        self.gui_toggle_generic(self.show_scat_symm, 'show_scat_symm', self.scat_symm)
+        self.gui_toggle_generic(self.show_scat_data, 'show_scat_data', self.scat_data)
+        self.gui_toggle_generic(self.show_scat_latt, 'show_scat_latt', self.scat_latt)
+        self.gui_toggle_generic(self.show_scat_vecs, 'show_scat_vecs', self.plot_scat_vecs)
+        self.gui_toggle_generic(self.show_diff_vecs, 'show_diff_vecs', self.plot_diff_vecs)
+        self.gui_toggle_generic(self.show_cell_outline, 'show_cell_outline', self.plot_cell)
+        self.gui_toggle_generic(self.show_crystal, 'show_crystal', self.crystal_mesh)
+        self.gui_toggle_ewald_sphere(self.gui_show_ewald.isChecked())
+        self.gui_toggle_cell_axes(self.gui_show_axes.checkState())
+        self.gui_toggle_goni_axes(self.gui_show_gon_axes.checkState())
+
+        self.gui_toggle_detector(self.show_detector)
+        self.gui_toggle_detector_labels(self.show_detector_labels)
+        self.gui_toggle_ewald_labels(self.show_ewald_labels)
+
+    def add_dock_widget(self, title: str):
+        btn = QtWidgets.QPushButton(title)
+        btn.setCheckable(True)
+        btn.clicked.connect(lambda: box.setVisible(not btn.isChecked()))
+        box = QtWidgets.QGroupBox()
+        box_layout = QtWidgets.QFormLayout()
+        box_layout.setContentsMargins(5, 0, 5, 5)
+        box.setLayout(box_layout)
+        self.params_layout.addWidget(btn)
+        self.params_layout.addWidget(box)
+        self.params_layout.addSpacing(5)
+        return box_layout
+
+    def init_gui(self):
+        # Plot Options
+        self.box_gui_layout = self.add_dock_widget("Plot Options")
+        # plot projection
+        self.gui_plo_prj = QtWidgets.QCheckBox()
+        self.gui_plo_prj.setChecked(self.orth_proj)
+        self.gui_plo_prj.stateChanged.connect(self.gui_set_projection)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Orthographic Projection"), self.gui_plo_prj)
+        # Ewald sphere
+        self.gui_show_ewald = QtWidgets.QCheckBox()
+        self.gui_show_ewald.setChecked(self.show_ewald)
+        self.gui_show_ewald.stateChanged.connect(self.gui_toggle_ewald_sphere)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Ewald Sphere"), self.gui_show_ewald)
+        # show hkls of scan data
+        self.gui_show_hkls = QtWidgets.QCheckBox()
+        self.gui_show_hkls.setTristate(True)
+        self.gui_show_hkls.setCheckState(self.show_ewald_labels)
+        self.gui_show_hkls.stateChanged.connect(self.gui_toggle_ewald_labels)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show hkl labels"), self.gui_show_hkls)
+        # show reciprocal lattice points
+        self.gui_show_latt = QtWidgets.QCheckBox()
+        self.gui_show_latt.setChecked(self.show_scat_latt)
+        self.gui_show_latt.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_scat_latt', self.scat_latt))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Reciprocal Lattice"), self.gui_show_latt)
+        # show collected data
+        self.gui_show_data = QtWidgets.QCheckBox()
+        self.gui_show_data.setChecked(self.show_scat_data)
+        self.gui_show_data.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_scat_data', self.scat_data))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Collected Data"), self.gui_show_data)
+        # show symmetry equivalents
+        self.gui_show_symm = QtWidgets.QCheckBox()
+        self.gui_show_symm.setChecked(self.show_scat_symm)
+        self.gui_show_symm.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_scat_symm', self.scat_symm))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Symmetry Equivalents"), self.gui_show_symm)
+        # show diffracted beams
+        self.gui_show_scat_vecs = QtWidgets.QCheckBox()
+        self.gui_show_scat_vecs.setChecked(self.show_scat_vecs)
+        self.gui_show_scat_vecs.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_scat_vecs', self.plot_scat_vecs))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Scattering Vectors"), self.gui_show_scat_vecs)
+        # show scattering vectors
+        self.gui_show_diff_vecs = QtWidgets.QCheckBox()
+        self.gui_show_diff_vecs.setChecked(self.show_diff_vecs)
+        self.gui_show_diff_vecs.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_diff_vecs', self.plot_diff_vecs))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Diffracted Vectors"), self.gui_show_diff_vecs)
+        # Unit cell outline
+        self.gui_show_cell = QtWidgets.QCheckBox()
+        self.gui_show_cell.setChecked(self.show_cell_outline)
+        self.gui_show_cell.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_cell_outline', self.plot_cell))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Reciprocal Cell"), self.gui_show_cell)
+        # Crystal
+        self.gui_show_cryst = QtWidgets.QCheckBox()
+        self.gui_show_cryst.setChecked(self.show_crystal)
+        self.gui_show_cryst.stateChanged.connect(lambda state: self.gui_toggle_generic(state, 'show_crystal', self.crystal_mesh))
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Crystal"), self.gui_show_cryst)
+        # Cell axes
+        self.gui_show_axes = QtWidgets.QCheckBox()
+        self.gui_show_axes.setTristate(True)
+        self.gui_show_axes.setChecked(self.show_cell_axs)
+        self.gui_show_axes.stateChanged.connect(self.gui_toggle_cell_axes)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Unit Cell Axes"), self.gui_show_axes)
+        # Goniometer axes
+        self.gui_show_gon_axes = QtWidgets.QCheckBox()
+        self.gui_show_gon_axes.setTristate(True)
+        self.gui_show_gon_axes.setChecked(self.show_gon_axs)
+        self.gui_show_gon_axes.stateChanged.connect(self.gui_toggle_goni_axes)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Goniometer Axes"), self.gui_show_gon_axes)
+        # Detector
+        self.gui_show_detector = QtWidgets.QCheckBox()
+        self.gui_show_detector.setChecked(self.show_detector)
+        self.gui_show_detector.stateChanged.connect(self.gui_toggle_detector)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector"), self.gui_show_detector)
+        # Detector labels
+        self.gui_show_detector_labels = QtWidgets.QCheckBox()
+        self.gui_show_detector_labels.setTristate(True)
+        self.gui_show_detector_labels.setCheckState(self.show_detector_labels)
+        self.gui_show_detector_labels.stateChanged.connect(self.gui_toggle_detector_labels)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("Show Detector Labels"), self.gui_show_detector_labels)
+        # Reciprocal lattice alpha
+        self.gui_rlatt_alpha = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_rlatt_alpha.setMinimum(0.01)
+        self.gui_rlatt_alpha.setMaximum(1)
+        self.gui_rlatt_alpha.setDecimals(2)
+        self.gui_rlatt_alpha.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_rlatt_alpha.setSingleStep(0.01)
+        self.gui_rlatt_alpha.setValue(self.color_scat_latt.alphaF())
+        self.gui_rlatt_alpha.valueChanged.connect(self.gui_set_rlatt_alpha)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("RLATT Alpha"), self.gui_rlatt_alpha)
+        # Reciprocal lattice size
+        self.gui_rlatt_size = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_rlatt_size.setMinimum(0.001)
+        self.gui_rlatt_size.setMaximum(1)
+        self.gui_rlatt_size.setDecimals(3)
+        self.gui_rlatt_size.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_rlatt_size.setSingleStep(0.001)
+        self.gui_rlatt_size.setValue(self.plot_scat_rlatt_size)
+        self.gui_rlatt_size.valueChanged.connect(self.gui_set_rlatt_size)
+        self.box_gui_layout.addRow(QtWidgets.QLabel("RLATT Size"), self.gui_rlatt_size)
+
+        # Experimental Information
+        self.box_sample_layout = self.add_dock_widget("Experimental")
+        # Sample parameters
+        self.gui_sample_a = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_a.setMinimum(1)
+        self.gui_sample_a.setMaximum(100)
+        self.gui_sample_a.setDecimals(3)
+        self.gui_sample_a.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_a.setSingleStep(0.1)
+        self.gui_sample_a.setValue(self.par['sample_cell_a'])
+        self.gui_sample_a.setSuffix(' Å')
+        self.gui_sample_a.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("a"), self.gui_sample_a)
+        self.gui_sample_b = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_b.setMinimum(1)
+        self.gui_sample_b.setMaximum(100)
+        self.gui_sample_b.setDecimals(3)
+        self.gui_sample_b.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_b.setSingleStep(0.1)
+        self.gui_sample_b.setValue(self.par['sample_cell_b'])
+        self.gui_sample_b.setSuffix(' Å')
+        self.gui_sample_b.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("b"), self.gui_sample_b)
+        self.gui_sample_c = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_c.setMinimum(1)
+        self.gui_sample_c.setMaximum(100)
+        self.gui_sample_c.setDecimals(3)
+        self.gui_sample_c.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_c.setSingleStep(0.1)
+        self.gui_sample_c.setValue(self.par['sample_cell_c'])
+        self.gui_sample_c.setSuffix(' Å')
+        self.gui_sample_c.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("c"), self.gui_sample_c)
+        self.gui_sample_alpha = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_alpha.setMinimum(1)
+        self.gui_sample_alpha.setMaximum(180)
+        self.gui_sample_alpha.setDecimals(2)
+        self.gui_sample_alpha.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_alpha.setSingleStep(0.1)
+        self.gui_sample_alpha.setValue(self.par['sample_cell_alpha'])
+        self.gui_sample_alpha.setSuffix('°')
+        self.gui_sample_alpha.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Alpha"), self.gui_sample_alpha)
+        self.gui_sample_beta = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_beta.setMinimum(1)
+        self.gui_sample_beta.setMaximum(180)
+        self.gui_sample_beta.setDecimals(2)
+        self.gui_sample_beta.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_beta.setSingleStep(0.1)
+        self.gui_sample_beta.setValue(self.par['sample_cell_beta'])
+        self.gui_sample_beta.setSuffix('°')
+        self.gui_sample_beta.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Beta"), self.gui_sample_beta)
+        self.gui_sample_gamma = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_gamma.setMinimum(1)
+        self.gui_sample_gamma.setMaximum(180)
+        self.gui_sample_gamma.setDecimals(2)
+        self.gui_sample_gamma.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_gamma.setSingleStep(0.1)
+        self.gui_sample_gamma.setValue(self.par['sample_cell_gamma'])
+        self.gui_sample_gamma.setSuffix('°')
+        self.gui_sample_gamma.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Gamma"), self.gui_sample_gamma)
+        self.gui_sample_point_group = QtWidgets.QComboBox()
+        self.gui_sample_point_group.addItems(sorted(self.sym_dict.keys()))
+        self.gui_sample_point_group.setCurrentText(self.par['sample_point_group'])
+        self.gui_sample_point_group.currentTextChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Point Group"), self.gui_sample_point_group)
+        self.gui_sample_wavelength = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sample_wavelength.setMinimum(0.0001)
+        self.gui_sample_wavelength.setMaximum(10)
+        self.gui_sample_wavelength.setDecimals(5)
+        self.gui_sample_wavelength.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sample_wavelength.setSingleStep(0.00001)
+        self.gui_sample_wavelength.setAccelerated(True)
+        self.gui_sample_wavelength.setValue(self.par['wavelength']*1E10)
+        self.gui_sample_wavelength.setSuffix(' Å')
+        self.gui_sample_wavelength.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Wavelength"), self.gui_sample_wavelength)
+        self.gui_prd_res = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_prd_res.setMinimum(0.00005)
+        self.gui_prd_res.setMaximum(1)
+        self.gui_prd_res.setDecimals(5)
+        self.gui_prd_res.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_prd_res.setSingleStep(0.00001)
+        self.gui_prd_res.setValue(self.par['max_resolution']*1E10)
+        self.gui_prd_res.setSuffix(' Å')
+        self.gui_prd_res.valueChanged.connect(self.restart_check_enable)
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Resolution"), self.gui_prd_res)
+        self.gui_sample_random_om = QtWidgets.QCheckBox()
+        self.gui_sample_random_om.setChecked(self.par['sample_random_om'])
+        self.box_sample_layout.addRow(QtWidgets.QLabel("Random Orientation Matrix"), self.gui_sample_random_om)
+        self.gui_sample_apply = QtWidgets.QPushButton('Restart')
+        self.gui_sample_apply.setStyleSheet(f"background-color: {self.color_gui_buttons.name()}")
+        self.gui_sample_apply.clicked.connect(self.restart_new_cell)
+        self.box_sample_layout.addRow(self.gui_sample_apply)
+
+        # Detector parameters
+        self.box_det_layout = self.add_dock_widget("Detector")
+        self.gui_det_distance = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_det_distance.setMinimum(0)
+        self.gui_det_distance.setMaximum(10000000)
+        self.gui_det_distance.setDecimals(2)
+        self.gui_det_distance.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_det_distance.setSingleStep(1)
+        self.gui_det_distance.setValue(self.par['det_distance'] * 1E3)
+        self.gui_det_distance.setSuffix(' mm')
+        self.gui_det_distance.valueChanged.connect(self.gui_update_detector)
+        self.box_det_layout.addRow(QtWidgets.QLabel("Distance"), self.gui_det_distance)
+        self.gui_det_dim_2 = pg.QtWidgets.QSpinBox()
+        self.gui_det_dim_2.setMinimum(1)
+        self.gui_det_dim_2.setMaximum(10000)
+        self.gui_det_dim_2.setValue(self.par['det_pix_2'])
+        self.gui_det_dim_2.setSuffix(' px')
+        self.gui_det_dim_2.valueChanged.connect(self.gui_update_detector)
+        self.box_det_layout.addRow(QtWidgets.QLabel("Size x"), self.gui_det_dim_2)
+        self.gui_det_dim_1 = pg.QtWidgets.QSpinBox()
+        self.gui_det_dim_1.setMinimum(1)
+        self.gui_det_dim_1.setMaximum(10000)
+        self.gui_det_dim_1.setValue(self.par['det_pix_1'])
+        self.gui_det_dim_1.setSuffix(' px')
+        self.gui_det_dim_1.valueChanged.connect(self.gui_update_detector)
+        self.box_det_layout.addRow(QtWidgets.QLabel("Size y"), self.gui_det_dim_1)
+        self.gui_det_pix_size = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_det_pix_size.setMinimum(0.01)
+        self.gui_det_pix_size.setMaximum(10000)
+        self.gui_det_pix_size.setDecimals(2)
+        self.gui_det_pix_size.setSingleStep(1)
+        self.gui_det_pix_size.setValue(self.par['det_pix_s']*1E6)
+        self.gui_det_pix_size.setSuffix(' µm')
+        self.gui_det_pix_size.valueChanged.connect(self.gui_update_detector)
+        self.box_det_layout.addRow(QtWidgets.QLabel("Pixel Size"), self.gui_det_pix_size)
+
+        # Goniometer
+        self.box_gon_layout = self.add_dock_widget("Goniometer")
+        self.gui_gon_omg = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_gon_omg.setMinimum(-999999999)
+        self.gui_gon_omg.setMaximum(999999999)
+        self.gui_gon_omg.setDecimals(2)
+        self.gui_gon_omg.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_gon_omg.setSingleStep(1)
+        self.gui_gon_omg.setValue(self.par['gon_omg_ang'])
+        self.gui_gon_omg.setSuffix('°')
+        self.gui_gon_omg.valueChanged.connect(self.rotate_gon)
+        self.box_gon_layout.addRow(QtWidgets.QLabel("Omega"), self.gui_gon_omg)
+        self.gui_gon_chi = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_gon_chi.setMinimum(-999999999)
+        self.gui_gon_chi.setMaximum(999999999)
+        self.gui_gon_chi.setDecimals(2)
+        self.gui_gon_chi.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_gon_chi.setSingleStep(1)
+        self.gui_gon_chi.setValue(self.par['gon_chi_ang'])
+        self.gui_gon_chi.setSuffix('°')
+        self.gui_gon_chi.valueChanged.connect(self.rotate_gon)
+        self.box_gon_layout.addRow(QtWidgets.QLabel("Chi"), self.gui_gon_chi)
+        self.gui_gon_phi = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_gon_phi.setMinimum(-999999999)
+        self.gui_gon_phi.setMaximum(999999999)
+        self.gui_gon_phi.setDecimals(2)
+        self.gui_gon_phi.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_gon_phi.setSingleStep(1)
+        self.gui_gon_phi.setValue(self.par['gon_phi_ang'])
+        self.gui_gon_phi.setSuffix('°')
+        self.gui_gon_phi.valueChanged.connect(self.rotate_gon)
+        self.box_gon_layout.addRow(QtWidgets.QLabel("Phi"), self.gui_gon_phi)
+        self.gui_gon_tth = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_gon_tth.setMinimum(-360)
+        self.gui_gon_tth.setMaximum(360)
+        self.gui_gon_tth.setDecimals(2)
+        self.gui_gon_tth.setSingleStep(1)
+        self.gui_gon_tth.setValue(self.par['gon_tth_ang'])
+        self.gui_gon_tth.setSuffix('°')
+        self.gui_gon_tth.valueChanged.connect(self.rotate_gon_tth)
+        self.box_gon_layout.addRow(QtWidgets.QLabel("2-Theta"), self.gui_gon_tth)
+        self.gui_gon_tth_orientation = QtWidgets.QComboBox()
+        self.gui_gon_tth_orientation.addItems(['Vertical', 'Horizontal'])
+        self.box_gon_layout.addRow(QtWidgets.QLabel("2-Theta Orientation"), self.gui_gon_tth_orientation)
+
+        # Scan parameters
+        self.box_scan_layout = self.add_dock_widget("Scan Parameters")
+        self.gui_scan_axis = QtWidgets.QComboBox()
+        self.gui_scan_axis.addItems(['Omega', 'Phi', 'SFX'])
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Scan Axis"), self.gui_scan_axis)
+        self.gui_scan_speed = pg.QtWidgets.QSpinBox()
+        self.gui_scan_speed.setMinimum(1)
+        self.gui_scan_speed.setMaximum(1000)
+        self.gui_scan_speed.setStepType(pg.QtWidgets.QSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_scan_speed.setValue(self.par['scan_speed'])
+        self.gui_scan_speed.setSuffix(' ms/step')
+        self.gui_scan_speed.valueChanged.connect(self.gui_set_scan_speed)
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Scan Speed"), self.gui_scan_speed)
+        self.gui_scan_range = pg.QtWidgets.QSpinBox()
+        self.gui_scan_range.setMinimum(1)
+        self.gui_scan_range.setStepType(pg.QtWidgets.QSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_scan_range.setMaximum(999999999)
+        self.gui_scan_range.setValue(self.par['scan_range'])
+        self.gui_scan_range.setSuffix('°')
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Scan Range"), self.gui_scan_range)
+        self.gui_scan_step = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_scan_step.setMinimum(-1)
+        self.gui_scan_step.setMaximum(1)
+        self.gui_scan_step.setDecimals(3)
+        self.gui_scan_step.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_scan_step.setSingleStep(0.01)
+        self.gui_scan_step.setValue(self.par['scan_step'])
+        self.gui_scan_step.setSuffix('°')
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Scan Step"), self.gui_scan_step)
+        self.gui_scan_ewald_offset = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_scan_ewald_offset.setMinimum(0.0001)
+        self.gui_scan_ewald_offset.setMaximum(0.5)
+        self.gui_scan_ewald_offset.setDecimals(4)
+        self.gui_scan_ewald_offset.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_scan_ewald_offset.setSingleStep(0.0001)
+        self.gui_scan_ewald_offset.setAccelerated(True)
+        self.gui_scan_ewald_offset.setValue(self.par['ewald_offset'])
+        self.gui_scan_ewald_offset.setSuffix(' Å')
+        self.gui_scan_ewald_offset.valueChanged.connect(lambda: self.gui_set_par_generic('ewald_offset', self.gui_scan_ewald_offset.value()))
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Ewald Offset"), self.gui_scan_ewald_offset)
+        self.gui_scan_total = QtWidgets.QLabel()
+        self.gui_scan_total.setEnabled(False)
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Reflections"), self.gui_scan_total)
+        self.gui_scan_collected = QtWidgets.QLabel()
+        self.gui_scan_collected.setEnabled(False)
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Collected"), self.gui_scan_collected)
+        self.gui_scan_completeness = QtWidgets.QLabel()
+        self.gui_scan_completeness.setEnabled(False)
+        self.box_scan_layout.addRow(QtWidgets.QLabel("Completeness"), self.gui_scan_completeness)
+        self.gui_start_scan = QtWidgets.QPushButton('Start Scan')
+        self.gui_start_scan.setStyleSheet(f"background-color: {self.color_gui_buttons.name()}")
+        self.gui_start_scan.clicked.connect(self.scan_toggle)
+        self.box_scan_layout.addRow(self.gui_start_scan)
+
+        # Data collection strategy
+        self.box_strat_layout = self.add_dock_widget("Data Collection Strategy")
+        self.gui_strat_tab = QtWidgets.QTableWidget()
+        self.gui_strat_tab.setColumnCount(5)
+        self.gui_strat_tab.setHorizontalHeaderLabels(['Omega', 'Chi', 'Phi', 'Width', 'Range'])
+        self.gui_strat_tab.setAlternatingRowColors(True)
+        self.gui_strat_tab.setSortingEnabled(True)
+        self.gui_strat_tab.setFont(self.plot_fnt_tab)
+        #self.gui_strat_tab.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
+        self.gui_strat_tab.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.gui_strat_tab.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        #self.gui_strat_tab.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.gui_strat_tab.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        #self.gui_strat_tab.verticalHeader().sectionClicked.connect(print)
+        self.gui_strat_tab.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        self.box_strat_layout.addRow(self.gui_strat_tab)
+        for row in self.dc_strat:
+            row_pos = self.gui_strat_tab.rowCount()
+            self.gui_strat_tab.insertRow(row_pos)
+            for col in range(5):
+                item = QtWidgets.QTableWidgetItem(str(row[col]))
+                item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.gui_strat_tab.setItem(row_pos, col, item)
+
+        self.gui_strat_scan = QtWidgets.QPushButton('Run Strategy')
+        self.gui_strat_scan.setStyleSheet(f"background-color: {self.color_gui_buttons.name()}")
+        self.gui_strat_scan.clicked.connect(self.strat_toggle)
+        self.box_strat_layout.addRow(self.gui_strat_scan)
+
+        # SFX parameters
+        self.box_sfx_layout = self.add_dock_widget("SFX Parameters")
+        #self.gui_show_sfx_parcor = QtWidgets.QCheckBox()
+        #self.gui_show_sfx_parcor.setChecked(self.show_sfx_parcor)
+        #self.box_sfx_layout.addRow(QtWidgets.QLabel("Show ParCor"), self.gui_show_sfx_parcor)
+        self.gui_sfx_keep_all_data = QtWidgets.QCheckBox()
+        self.gui_sfx_keep_all_data.setChecked(self.sfx_keep_all_data)
+        self.box_sfx_layout.addRow(QtWidgets.QLabel("Keep All Data"), self.gui_sfx_keep_all_data)
+        self.gui_sfx_spectral_width = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sfx_spectral_width.setMinimum(1E-10)
+        self.gui_sfx_spectral_width.setMaximum(1E10)
+        self.gui_sfx_spectral_width.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sfx_spectral_width.setSingleStep(0.001)
+        self.gui_sfx_spectral_width.setDecimals(4)
+        self.gui_sfx_spectral_width.setValue(self.par['sfx_spectral_width'])
+        self.gui_sfx_spectral_width.setSuffix('')
+        self.gui_sfx_spectral_width.valueChanged.connect(lambda: self.gui_set_par_generic('sfx_spectral_width', self.gui_sfx_spectral_width.value()))
+        self.box_sfx_layout.addRow(QtWidgets.QLabel("Spectral width"), self.gui_sfx_spectral_width)
+        self.gui_sfx_rlp_size = pg.QtWidgets.QDoubleSpinBox()
+        self.gui_sfx_rlp_size.setMinimum(1E-10)
+        self.gui_sfx_rlp_size.setMaximum(1E10)
+        self.gui_sfx_rlp_size.setStepType(pg.QtWidgets.QDoubleSpinBox.StepType.AdaptiveDecimalStepType)
+        self.gui_sfx_rlp_size.setSingleStep(0.001)
+        self.gui_sfx_rlp_size.setDecimals(4)
+        self.gui_sfx_rlp_size.setValue(self.par['sfx_rlp_size'])
+        self.gui_sfx_rlp_size.setSuffix('')
+        self.gui_sfx_rlp_size.valueChanged.connect(lambda: self.gui_set_par_generic('sfx_rlp_size', self.gui_sfx_rlp_size.value()))
+        self.box_sfx_layout.addRow(QtWidgets.QLabel("RLP Size"), self.gui_sfx_rlp_size)
+        
+        # Data collection
+        self.box_dat_layout = self.add_dock_widget("Data Collection")
+        self.gui_dat_tab = QtWidgets.QTableWidget()
+        self.gui_dat_tab.setColumnCount(6)
+        self.gui_dat_tab.setHorizontalHeaderLabels(['h', 'k', 'l', 'd', 'poc', 'pac'])
+        # Right align table contents
+        class AlignDelegate(QtWidgets.QStyledItemDelegate):
+            def initStyleOption(self, option, index):
+                super(AlignDelegate, self).initStyleOption(option, index)
+                #option.displayAlignment = QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+                option.displayAlignment = QtCore.Qt.AlignmentFlag.AlignCenter
+                #option.font.setFamily('Courier New')
+        self.gui_dat_tab.setItemDelegate(AlignDelegate())
+        self.gui_dat_tab.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.gui_dat_tab.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.gui_dat_tab.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
+        self.gui_dat_tab.setAlternatingRowColors(True)
+        self.gui_dat_tab.setSortingEnabled(True)
+        self.gui_dat_tab.setFont(self.plot_fnt_tab)
+        self.gui_dat_tab.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        #self.gui_dat_tab.horizontalHeader().setVisible(False)
+        #self.gui_dat_tab.verticalHeader().setVisible(False)
+        self.gui_dat_tab.itemSelectionChanged.connect(self.data_table_selection_changed)
+        self.gui_dat_tab.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.gui_dat_tab.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        # Set i, hkl columns to resize to contents
+        self.gui_dat_tab.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.gui_dat_tab.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.gui_dat_tab.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.box_dat_layout.addRow(self.gui_dat_tab)
+
+        # Set minimum width of parameter scroll area to fit all unfolded parameters
+        self.parameter_scroll.setMinimumWidth(self.parameter_box.sizeHint().width() + 20)
+
+    def gui_set_rlatt_size(self, value):
+        self.scat_latt.setData(size=value)
+        self.plot_scat_rlatt_size = value
+
+    def gui_set_rlatt_alpha(self, value):
+        self.color_scat_latt.setAlphaF(value)
+        self.scat_latt.setData(color=self.color_scat_latt)
+        self.plot_scat_rlatt_alpha = value
+
+    def data_table_selection_changed(self):
+        rows = [i.data(QtCore.Qt.ItemDataRole.UserRole) for i in self.gui_dat_tab.selectedItems() if i.column() == 0]
+        self.scan_add_labels(self.scan_data.loc[rows])
+    
+    def init_gui_parameters(self):
+        # Update parameters from GUI
+        self.par['sample_cell_a'] = self.gui_sample_a.value()
+        self.par['sample_cell_b'] = self.gui_sample_b.value()
+        self.par['sample_cell_c'] = self.gui_sample_c.value()
+        self.par['sample_cell_alpha'] = self.gui_sample_alpha.value()
+        self.par['sample_cell_beta'] = self.gui_sample_beta.value()
+        self.par['sample_cell_gamma'] = self.gui_sample_gamma.value()
+        self.par['wavelength'] = self.gui_sample_wavelength.value() * 1E-10
+        self.par['max_resolution'] = self.gui_prd_res.value() * 1E-10
+        self.par['sample_point_group'] = self.gui_sample_point_group.currentText()
+
+        # Calculate ewald radius
+        self.ewald_rad = 1/(self.par['wavelength']*1E10) # in [A^-1]
+        # Calculate incident beam vector
+        self.par['exp_incident_beam_vector'] = np.array([0, 0, self.ewald_rad])
+        # Calculate reciprocal space
+        self.UC = matrix_from_cell([self.par['sample_cell_a'],
+                                    self.par['sample_cell_b'],
+                                    self.par['sample_cell_c'],
+                                    self.par['sample_cell_alpha'],
+                                    self.par['sample_cell_beta'],
+                                    self.par['sample_cell_gamma']])
+        # Apply orientation matrix
+        self.OM_UC = self.OM.to_rotation_matrix() @ self.UC
+        # get symmetry operations for new point group
+        self.get_sym_ops()
+        
+        self.hkls = calc_hkls(self.OM_UC, self.par['max_resolution'])
+        #self.hkls_set = set(map(tuple, self.hkls))
+        self.hkls_num = len(self.hkls)
+        self.hkl_bases = self.hkls @ self.OM_UC.T * 1E-10
+
+    def init_goniometer(self):
+        # Update GUI
+        self.gui_scan_total.setText(f'{self.hkls_num}')
+        self.gui_scan_completeness.setText(f'{len(self.scan_data)/self.hkls_num*100:.0f} % ({(len(self.scan_symm)+len(self.scan_data))/self.hkls_num*100:.0f} %)')
+        self.gui_scan_collected.setText(f'{len(self.scan_data)} ({len(self.scan_symm)+len(self.scan_data)})')
+        self.scan_progress = 0
+        # Reset goniometer rotation (new hkl are calculated in this orientation)
+        self.gui_gon_phi.setValue(0.0)
+        self.gui_gon_chi.setValue(0.0)
+        self.gui_gon_omg.setValue(0.0)
+        self.gui_gon_tth.setValue(0.0)
+        self.par['gon_phi_ang'] = 0.0
+        self.par['gon_chi_ang'] = 0.0
+        self.par['gon_omg_ang'] = 0.0
+        self.par['gon_tth_ang'] = 0.0
+        self.rotate_gon_tth(relative=False)
+
+    def init_plot(self):
+        #################
+        #    Detector   #
+        #################
+        self.plot_add_detector()
+
+        # Scattering pattern on detector
+        self.scat_pattern = gl.GLScatterPlotItem(size=max(self.plot_det_dist/50, 0.2),
+                                                 color=self.color_scat_patt,
+                                                 pxMode=False)
+        self.gl3d.addItem(self.scat_pattern, center=True)
+
+        #################
+        # Axes / Labels #
+        #################
+        cell_axs = self.OM_UC * 1E-10
+        axs_a = cell_axs[:,0]
+        axs_b = cell_axs[:,1]
+        axs_c = cell_axs[:,2]
+        # create the unit cell
+        verts = np.array([[ 0, 0, 0],
+                           axs_a, axs_b, axs_c,
+                           axs_a + axs_b,
+                           axs_a + axs_c,
+                           axs_b + axs_c,
+                           axs_a + axs_b + axs_c], dtype=float)
+        edges = np.array([[0,1],[0,2],[0,3],
+                          [1,4],[2,4],
+                          [1,5],[3,5],
+                          [2,6],[3,6],
+                          [7,4],[7,5],[7,6]], dtype=int)
+        self.plot_cell = gl.GLGraphItem(glOptions='translucent')
+        self.plot_cell.setData(edges=edges, nodePositions=verts,
+                               edgeColor=QtGui.QColor("#FFFFFF"),
+                               edgeWidth=self.plot_line_width)
+        self.gl3d.addItem(self.plot_cell)
+        # create the axis lines
+        self.plot_ax_a = gl.GLLinePlotItem()
+        self.plot_ax_a.setData(pos=np.array([[0,0,0], axs_a]),
+                                color=QtGui.QColor("#FF0000"),
+                                width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.plot_ax_a)
+        self.plot_ax_b = gl.GLLinePlotItem()
+        self.plot_ax_b.setData(pos=np.array([[0,0,0], axs_b]),
+                                color=QtGui.QColor("#11FF00"),
+                                width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.plot_ax_b)
+        self.plot_ax_c = gl.GLLinePlotItem()
+        self.plot_ax_c.setData(pos=np.array([[0,0,0], axs_c]),
+                                color=QtGui.QColor("#0015FF"),
+                                width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.plot_ax_c)
+        # Axis labels
+        self.plot_ax_a_lbl = gl.GLTextItem(text='a*',
+                                           color=QtGui.QColor("#FF0000"),
+                                           font=self.plot_fnt_lbl,
+                                           parentItem=self.plot_ax_a)
+        self.plot_ax_a_lbl.translate(*axs_a/2)
+        self.gl3d.addItem(self.plot_ax_a_lbl)
+        self.plot_ax_b_lbl = gl.GLTextItem(text='b*',
+                                           color=QtGui.QColor("#11FF00"),
+                                           font=self.plot_fnt_lbl,
+                                           parentItem=self.plot_ax_b)
+        self.plot_ax_b_lbl.translate(*axs_b/2)
+        self.gl3d.addItem(self.plot_ax_b_lbl)
+        self.plot_ax_c_lbl = gl.GLTextItem(text='c*',
+                                           color=QtGui.QColor("#0015FF"),
+                                           font=self.plot_fnt_lbl,
+                                           parentItem=self.plot_ax_c)
+        self.plot_ax_c_lbl.translate(*axs_c/2)
+        self.gl3d.addItem(self.plot_ax_c_lbl)
+        # create the goniometer axis lines
+        self.plot_gon_phi = gl.GLLinePlotItem()
+        self.plot_gon_phi.setData(pos=np.array([[0,0,0], self.par['gon_phi_axs']]),
+                                    color=QtGui.QColor("#FF00FF"),
+                                    width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.plot_gon_phi)
+        self.plot_gon_chi = gl.GLLinePlotItem()
+        self.plot_gon_chi.setData(pos=np.array([[0,0,0], self.par['gon_chi_axs']]),
+                                    color=QtGui.QColor("#00FFFF"),
+                                    width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.plot_gon_chi)
+        self.plot_gon_omg = gl.GLLinePlotItem()
+        self.plot_gon_omg.setData(pos=np.array([[0,0,0], self.par['gon_omg_axs']]),
+                                    color=QtGui.QColor("#FFFF00"),
+                                    width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.plot_gon_omg)
+        # Goniometer axis labels
+        self.plot_gon_phi_lbl = gl.GLTextItem(text='\u03D5',
+                                              color=QtGui.QColor("#FF00FF"),
+                                              font=self.plot_fnt_lbl,
+                                              parentItem=self.plot_gon_phi)
+        self.plot_gon_phi_lbl.translate(*self.par['gon_phi_axs'])
+        self.gl3d.addItem(self.plot_gon_phi_lbl)
+        self.plot_gon_chi_lbl = gl.GLTextItem(text='\u03A7',
+                                              color=QtGui.QColor("#00FFFF"),
+                                              font=self.plot_fnt_lbl,
+                                              parentItem=self.plot_gon_chi)
+        self.plot_gon_chi_lbl.translate(*self.par['gon_chi_axs'])
+        self.gl3d.addItem(self.plot_gon_chi_lbl)
+        self.plot_gon_omg_lbl = gl.GLTextItem(text='\u03A9',
+                                              color=QtGui.QColor("#FFFF00"),
+                                              font=self.plot_fnt_lbl,
+                                              parentItem=self.plot_gon_omg)
+        self.plot_gon_omg_lbl.translate(*self.par['gon_omg_axs'])
+        self.gl3d.addItem(self.plot_gon_omg_lbl)
+
+        #################
+        # scatter plots #
+        #################
+        # Reciprocal lattice points
+        self.scat_latt = gl.GLScatterPlotItem(pos=self.hkl_bases,
+                                              size=self.plot_scat_rlatt_size,
+                                              color=self.color_scat_latt,
+                                              pxMode=False)
+        self.gl3d.addItem(self.scat_latt)
+        
+        # Symmetry equivalents
+        self.scat_symm = gl.GLScatterPlotItem(size=self.plot_scat_point_size,
+                                              color=self.color_scat_symm,
+                                              pxMode=False)
+        self.gl3d.addItem(self.scat_symm)
+        
+        # Collected data points
+        self.scat_data = gl.GLScatterPlotItem(size=self.plot_scat_point_size,
+                                              color=self.color_scat_data,
+                                              pxMode=False)
+        self.gl3d.addItem(self.scat_data)
+
+        # Scanned RLP
+        self.scat_scan = gl.GLScatterPlotItem(size=self.plot_scat_point_size,
+                                              color=self.color_scat_scan,
+                                              pxMode=False,
+                                              glOptions='opaque')
+        self.gl3d.addItem(self.scat_scan, center=True)
+
+        """
+        # Maximum resolution circle
+        self.plot_max_res_circle = gl.GLLinePlotItem()
+        theta = np.linspace(0, 2*np.pi, 100)
+        x = self.plot_det_dist * np.cos(theta)
+        y = self.plot_det_dist * np.sin(theta)
+        z = np.zeros_like(x) + self.plot_det_dist
+        print(x, y, z)
+        self.plot_max_res_circle.setData(pos=np.vstack([x,y,z]).T,
+                                         color=(0.5,0.5,0.5,0.5),
+                                         width=self.plot_line_width_thick)
+        #self.plot_max_res_circle.rotate(45, 0, 1, 0)
+        #self.plot_max_res_circle.translate(self.ewald_rad, 0, -self.ewald_rad)
+        self.gl3d.addItem(self.plot_max_res_circle)
+        """
+
+        #################
+        #    Vectors    #
+        #################
+        # Incident beam vector
+        self.ewald_ki = gl.GLLinePlotItem()
+        self.ewald_ki.setData(pos=np.array([[0,0,-self.ewald_rad*2],[0,0,-self.ewald_rad]]),
+                        color="#AB1E6E", width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.ewald_ki)
+        # Primary beam vector
+        self.ewald_ko = gl.GLLinePlotItem()
+        self.ewald_ko.setData(pos=np.array([[0,0,-self.ewald_rad],[0,0,0]]),
+                        color="#1EAB60", width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.ewald_ko)
+        # Scattering vectors
+        self.plot_scat_vecs = gl.GLGraphItem(edgeColor=self.color_scat_vecs,
+                                             nodeColor=self.color_scat_vecs,
+                                             edgeWidth=self.plot_line_width_thick,
+                                             glOptions='translucent')
+        self.gl3d.addItem(self.plot_scat_vecs)
+        # Diffracted beam vectors
+        self.plot_diff_vecs = gl.GLGraphItem(edgeColor=self.color_diff_vecs,
+                                             nodeColor=self.color_diff_vecs,
+                                             edgeWidth=self.plot_line_width_thick,
+                                             glOptions='translucent')
+        self.gl3d.addItem(self.plot_diff_vecs)
+
+        ##################
+        # Create crystal #
+        ##################
+        verts, faces, edges = self.make_icosahedron_mesh(scale=0.15)
+        mesh_cr = gl.MeshData(vertexes=verts,
+                              faces=faces,
+                              faceColors=np.array([[0.55, 0.75, 1.0, 0.85]] * len(faces), dtype=np.float32),
+                              #vertexColors=np.array([[1,1,1,1]] * len(verts), dtype=np.float32),
+                              )
+        self.crystal_mesh = gl.GLMeshItem(meshdata=mesh_cr,
+                                          smooth=True,
+                                          drawEdges=True,
+                                          drawFaces=True,
+                                          edgeColor=(1,1,1,1),
+                                          #faceColors=np.array([0.55, 0.75, 1.0, 0.95], dtype=np.float32),
+                                          shader='balloon',
+                                          polygonOffset=True,
+                                          )
+        self.crystal_mesh.setGLOptions('translucent')
+        self.crystal_mesh.translate(0.0, 0.0, -self.ewald_rad)
+        self.gl3d.addItem(self.crystal_mesh)
+
+        #################
+        #   hkl Labels  #
+        #################
+        # hkl text labels
+        self.list_ewald_labels = []
+        for _ in range(self.par['plot_max_hkl_labels']):
+
+            _text_hkls = GLWrappedTextItem(font=self.plot_fnt_hkl,
+                                           color=self.color_labl_hkls,
+                                           alignment=QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop)
+            self.gl3d.addItem(_text_hkls)
+            self.list_ewald_labels.append(_text_hkls)
+
+        # hkl text labels (detector)
+        self.list_detector_labels = []
+        for _ in range(self.par['plot_max_hkl_labels']):
+            _text_det = GLWrappedTextItem(font=self.plot_fnt_hkl,
+                                          color=self.color_labl_hkls,
+                                          alignment=QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop)
+            self.gl3d.addItem(_text_det)
+            self.list_detector_labels.append(_text_det)
+
+        ################
+        # Ewald sphere #
+        ################
+        """
+        # Inner Ewald sphere (for SFX spectral width)
+        self.ewald_sphere_inner = gl.GLMeshItem()
+        self.ewald_sphere_inner.setMeshData(drawEdges=False, 
+                                            meshdata=gl.MeshData.sphere(rows=100,
+                                                                        cols=100,
+                                                                        radius=self.ewald_rad+self.par['sfx_spectral_width']/2))
+        self.ewald_sphere_inner.translate(0, 0, -self.ewald_rad-self.par['sfx_spectral_width']/2)
+        self.ewald_sphere_inner.setGLOptions('additive')
+        self.ewald_sphere_inner.setColor((0.9, 0.0, 0.0, 0.1))
+        self.gl3d.addItem(self.ewald_sphere_inner)
+        
+        # Outer Ewald sphere
+        self.ewald_sphere_outer = gl.GLMeshItem()
+        self.ewald_sphere_outer.setMeshData(drawEdges=False, 
+                                            meshdata=gl.MeshData.sphere(rows=100,
+                                                                        cols=100,
+                                                                        radius=self.ewald_rad-self.par['sfx_spectral_width']/2))
+        self.ewald_sphere_outer.translate(0, 0, -self.ewald_rad+self.par['sfx_spectral_width']/2)
+        self.ewald_sphere_outer.setGLOptions('additive')
+        self.ewald_sphere_outer.setColor((0.0, 0.0, 0.9, 0.1))
+        self.gl3d.addItem(self.ewald_sphere_outer)
+        """
+
+        self.ewald_sphere = gl.GLMeshItem()
+        self.ewald_sphere.setMeshData(drawEdges=False,
+                                      smooth=False,
+                                      shader='balloon_glow',
+                                      meshdata=gl.MeshData.sphere(rows=100,
+                                                                  cols=100,
+                                                                  radius=self.ewald_rad))
+        self.ewald_sphere.translate(0, 0, -self.ewald_rad)
+        self.ewald_sphere.setGLOptions('translucent')
+        self.ewald_sphere.setColor((0.2, 0.4, 0.6, 0.2))
+
+        self.gl3d.addItem(self.ewald_sphere)
+        # Ewald sphere outline ab
+        self.ewald_outline_ab = gl.GLLinePlotItem()
+        theta = np.linspace(0, 2*np.pi, 100)
+        x = self.ewald_rad * np.cos(theta)
+        y = self.ewald_rad * np.sin(theta)
+        z = np.zeros_like(x) - self.ewald_rad
+        self.ewald_outline_ab.setData(pos=np.vstack([x,y,z]).T,
+                                      color=(0.5,0.5,0.5,0.5),
+                                      width=self.plot_line_width_thick)
+        self.gl3d.addItem(self.ewald_outline_ab)
+        # Ewald sphere outline bc
+        self.ewald_outline_bc = gl.GLLinePlotItem()
+        self.ewald_outline_bc.setData(pos=np.vstack([x,y,z]).T,
+                                      color=(0.5,0.5,0.5,0.5),
+                                      width=self.plot_line_width_thick)
+        self.ewald_outline_bc.rotate(90, 0, 1, 0)
+        self.ewald_outline_bc.translate(self.ewald_rad, 0, -self.ewald_rad)
+        self.gl3d.addItem(self.ewald_outline_bc)
+        # Ewald sphere outline ac
+        self.ewald_outline_ac = gl.GLLinePlotItem()
+        self.ewald_outline_ac.setData(pos=np.vstack([x,y,z]).T,
+                                      color=(0.5,0.5,0.5,0.5),
+                                      width=self.plot_line_width_thick)
+        self.ewald_outline_ac.rotate(90, 1, 0, 0)
+        self.ewald_outline_ac.translate(0, -self.ewald_rad, -self.ewald_rad)
+        self.gl3d.addItem(self.ewald_outline_ac)
+
+        # Initial toggle states
+        self.gui_toggle_ewald_labels(self.show_ewald_labels)
+        self.gui_toggle_detector_labels(self.show_detector_labels)
+
+    def make_icosahedron_mesh(self, scale=1.0):
+        """
+        Create a regular icosahedron suitable for pyqtgraph.gl.MeshData / GLMeshItem.
+
+        Returns:
+        - verts: (12,3) float32 vertex positions centered at origin (scaled)
+        - tri_faces: (20,3) int32 triangle indices
+        - edges: (30,2) int32 unique perimeter edges for outline
+        """
+        import numpy as _np
+        phi = (1.0 + _np.sqrt(5.0)) / 2.0
+
+        verts = _np.array([
+            (-1,  phi,  0),
+            ( 1,  phi,  0),
+            (-1, -phi,  0),
+            ( 1, -phi,  0),
+            ( 0, -1,  phi),
+            ( 0,  1,  phi),
+            ( 0, -1, -phi),
+            ( 0,  1, -phi),
+            ( phi,  0, -1),
+            ( phi,  0,  1),
+            (-phi,  0, -1),
+            (-phi,  0,  1),
+        ], dtype=float)
+
+        # 20 triangular faces (indices into verts)
+        faces = _np.array([
+            [0,11,5], [0,5,1], [0,1,7], [0,7,10], [0,10,11],
+            [1,5,9], [5,11,4], [11,10,2], [10,7,6], [7,1,8],
+            [3,9,4], [3,4,2], [3,2,6], [3,6,8], [3,8,9],
+            [4,9,5], [2,4,11], [6,2,10], [8,6,7], [9,8,1],
+        ], dtype=int)
+
+        # normalize to unit radius and apply scale
+        verts = verts / _np.linalg.norm(verts, axis=1).max() * float(scale)
+
+        # collect unique edges from triangle faces
+        edge_set = set()
+        for f in faces:
+            a, b, c = int(f[0]), int(f[1]), int(f[2])
+            edge_set.add(tuple(sorted((a, b))))
+            edge_set.add(tuple(sorted((b, c))))
+            edge_set.add(tuple(sorted((c, a))))
+        edges = _np.array(sorted(edge_set), dtype=int)
+
+        return verts.astype(_np.float32), faces.astype(_np.int32), edges.astype(_np.int32)
+
+    def plot_add_detector(self):
+        #if hasattr(self, 'plot_detector') and self.plot_detector in self.gl3d.items:
+        #    self.gl3d.removeItem(self.plot_detector)
+        if hasattr(self, 'detector_plane') and self.detector_plane in self.gl3d.items:
+            self.gl3d.removeItem(self.detector_plane)
+        if hasattr(self, 'detector_frame') and self.detector_frame in self.gl3d.items:
+            self.gl3d.removeItem(self.detector_frame)
+
+        # Determine scale factor to convert from real detector coordinates to plot coordinates
+        self.plot_scale_factor = self.par['det_distance'] / self.plot_det_dist
+
+        # Detector dimensions in plot coordinates
+        det_hor_full = self.par['det_pix_1'] * self.par['det_pix_s'] / self.plot_scale_factor
+        det_ver_full = self.par['det_pix_2'] * self.par['det_pix_s'] / self.plot_scale_factor
+        det_hor_half = det_hor_full / 2
+        det_ver_half = det_ver_full / 2
+        det_bch = self.par['det_poni_1'] / self.plot_scale_factor
+        det_bcv = self.par['det_poni_2'] / self.plot_scale_factor
+
+        # Create a thin 3D mesh frame (rectangular ring) around the detector face so the edges are clearly visible
+        # Extrude the ring by a small depth in z to give it volume
+        frame_frac = 0.05
+        frame_thickness = max(min(det_hor_half, det_ver_half) * frame_frac, 1e-9)
+        inner_half_w = max(det_hor_half + frame_thickness, 1e-9)
+        inner_half_h = max(det_ver_half + frame_thickness, 1e-9)
+        half_depth = frame_thickness * 0.5
+        # vertical, horizontal, distance
+        #_translate = (-det_ver_half+det_bcv, -det_hor_half+det_bch, self.plot_det_dist)
+        _translate = (det_hor_half-det_bch, det_ver_half-det_bcv, self.plot_det_dist)
+
+        verts_list = []
+        faces_list = []
+
+        def add_box(x1, y1, x2, y2, z0, z1):
+            base_idx = len(verts_list)
+            # lower z0 (4 verts)
+            verts_list.extend([[x1, y1, z0],
+                               [x2, y1, z0],
+                               [x2, y2, z0],
+                               [x1, y2, z0]])
+            # upper z1 (4 verts)
+            verts_list.extend([[x1, y1, z1],
+                               [x2, y1, z1],
+                               [x2, y2, z1],
+                               [x1, y2, z1]])
+            # lower face
+            faces_list.append([base_idx,
+                               base_idx+1,
+                               base_idx+2])
+            faces_list.append([base_idx,
+                               base_idx+2,
+                               base_idx+3])
+            # upper face (note winding)
+            faces_list.append([base_idx+4,
+                               base_idx+6,
+                               base_idx+5])
+            faces_list.append([base_idx+4,
+                               base_idx+7,
+                               base_idx+6])
+            # side faces (4 sides)
+            sides = [(0,1,5,4),
+                     (1,2,6,5),
+                     (2,3,7,6),
+                     (3,0,4,7)]
+            for a,b,c,d in sides:
+                faces_list.append([base_idx+a,
+                                   base_idx+b,
+                                   base_idx+c])
+                faces_list.append([base_idx+a,
+                                   base_idx+c,
+                                   base_idx+d])
+
+        # Left box (strip)
+        add_box(-det_hor_half, -det_ver_half, -inner_half_w, det_ver_half, -half_depth, half_depth)
+        # Right box
+        add_box(inner_half_w, -det_ver_half, det_hor_half, det_ver_half, -half_depth, half_depth)
+        # Bottom box
+        add_box(-inner_half_w, -det_ver_half, inner_half_w, -inner_half_h, -half_depth, half_depth)
+        # Top box
+        add_box(-inner_half_w, inner_half_h, inner_half_w, det_ver_half, -half_depth, half_depth)
+
+        verts_arr = np.array(verts_list, dtype=np.float32)
+        faces_arr = np.array(faces_list, dtype=np.int32)
+        face_colors = np.tile(np.array((0.5, 0.5, 0.5, 0.9), dtype=np.float32), (len(faces_arr), 1))
+        meshdata_frame = gl.MeshData(vertexes=verts_arr, faces=faces_arr, faceColors=face_colors, vertexColors=None)
+        self.detector_frame = gl.GLMeshItem(meshdata=meshdata_frame, smooth=True, computeNormals=True, drawEdges=False, drawFaces=True)
+        self.detector_frame.setGLOptions('translucent')
+        self.detector_frame.setShader('balloon')
+        #self.detector_frame.setDepthValue(-1)
+        self.detector_frame.translate(*_translate)
+        self.gl3d.addItem(self.detector_frame)
+
+        # Detector face
+        #self.plot_detector = gl.GLSurfacePlotItem()
+        #self.plot_detector.setGLOptions('translucent')
+        #self.plot_detector.setData(x=np.array([-det_hor_half, det_hor_half]),
+        #                           y=np.array([-det_ver_half, det_ver_half]),
+        #                           z=np.zeros((2, 2)))
+        #self.plot_detector.setColor(self.color_detector)
+        #self.plot_detector.setDepthValue(-1)
+        #self.plot_detector.translate(*_translate)
+        #self.gl3d.addItem(self.plot_detector)
+
+        # Create a plane to represent the detector
+        #verts = np.array([[-det_hor_half, -det_ver_half, 0],
+        #                  [ det_hor_half, -det_ver_half, 0],
+        #                  [ det_hor_half,  det_ver_half, 0],
+        #                  [-det_hor_half,  det_ver_half, 0],
+        #                  [     0,      0, 0]], dtype=np.float32)
+        #faces = np.array([[1,2,4],
+        #                  [0,1,4],
+        #                  [2,3,4],
+        #                  [3,0,4]], dtype=np.int8)
+        #colors = np.ones((len(faces), 4), dtype=np.float32) * np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+        #meshdata = gl.MeshData(vertexes=verts, faces=faces, faceColors=colors)
+        #self.detector_plane = gl.GLMeshItem(meshdata=meshdata, smooth=True, drawEdges=False, edgeColor=(1,1,1,1), drawFaces=True)
+        #self.detector_plane.setGLOptions('translucent')
+        #self.detector_plane.setDepthValue(-1)
+        #self.detector_plane.translate(*_translate)
+        #self.gl3d.addItem(self.detector_plane)
+
+        RGBA, has_alpha = pg.makeARGB(self.det_img_data, lut=pg.colormap.get('viridis').getLookupTable(0.0, 1.0, 128), levels=(0, 100))
+        self.detector_plane = gl.GLImageItem(RGBA)
+        self.detector_plane.setDepthValue(-1)
+        self.detector_plane.scale(det_hor_full/RGBA.shape[0], det_ver_full/RGBA.shape[1], 1)
+        self.detector_plane.translate(*(_translate-np.array([det_hor_half, det_ver_half, 0])))
+        self.detector_plane.setGLOptions('additive')
+        self.gl3d.addItem(self.detector_plane)
+
+    def gui_update_detector(self):
+        # compute previous PONI in pixels
+        old_poni_px_1 = self.par['det_poni_1'] / self.par['det_pix_s']
+        old_poni_px_2 = self.par['det_poni_2'] / self.par['det_pix_s']
+        old_det_px_1 = self.par['det_pix_1']
+        old_det_px_2 = self.par['det_pix_2']
+
+        # Update detector parameters from GUI
+        self.par['det_distance'] = self.gui_det_distance.value() * 1E-3
+        self.par['det_pix_1'] = self.gui_det_dim_1.value()
+        self.par['det_pix_2'] = self.gui_det_dim_2.value()
+        self.par['det_pix_s'] = self.gui_det_pix_size.value() * 1E-6
+
+        # preserve fractional position relative to detector dimensions
+        # compute fraction within old detector [0..1]
+        frac_x = old_poni_px_1 / old_det_px_1
+        frac_y = old_poni_px_2 / old_det_px_2
+        # map to new pixel coordinates and then to physical units
+        new_px_x = frac_x * float(self.par['det_pix_1'])
+        new_px_y = frac_y * float(self.par['det_pix_2'])
+        self.par['det_poni_1'] = new_px_x * self.par['det_pix_s']
+        self.par['det_poni_2'] = new_px_y * self.par['det_pix_s']
+
+        self.plot_add_detector()
+        self.rotate_gon_tth(relative=False)
+
+    def gui_detector_image(self,
+                           shape=(1920, 1920),
+                           background_level=1.0,
+                           noise_sigma=1.0,
+                           gauss_amp=100.0,
+                           gauss_sigma=50.0,
+                           gauss_center=None,
+                           seed=None):
+        """
+        Create a 2D placeholder detector image with Gaussian air-scattering peak + noisy background.
+
+        Parameters
+        - shape : tuple[int,int]
+            (height, width) of the image in pixels.
+        - background_level : float
+            Constant background counts (baseline air scatter).
+        - noise_sigma : float
+            Standard deviation of additive Gaussian noise (counts).
+        - gauss_amp : float
+            Peak amplitude of the Gaussian air-scatter contribution (above background).
+        - gauss_sigma : float
+            Gaussian sigma in pixels (isotropic).
+        - gauss_center : tuple[float,float] | None
+            (y, x) center of the Gaussian in pixels. If None, center of the image is used.
+        - seed : int | None
+            RNG seed for reproducible noise.
+
+        Returns
+        - img : np.ndarray, shape (H, W), dtype=float32
+            Simulated detector intensity image (counts).
+        """
+        import numpy as _np
+        rng = _np.random.default_rng(seed)
+
+        H, W = shape
+        if gauss_center is None:
+            cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+        else:
+            cy, cx = float(gauss_center[0]), float(gauss_center[1])
+
+        y = _np.arange(H, dtype=_np.float32)[:, None]
+        x = _np.arange(W, dtype=_np.float32)[None, :]
+
+        r2 = (y - cy)**2 + (x - cx)**2
+        gauss = gauss_amp * _np.exp(-0.5 * r2 / (gauss_sigma**2))
+
+        # Baseline + gaussian signal
+        img = background_level + gauss
+
+        # Additive Gaussian noise
+        if noise_sigma > 0:
+            img = img + rng.normal(loc=0.0, scale=noise_sigma, size=img.shape)
+
+        # Convert to Poisson-distributed counts (simulate photon noise)
+        # ensure non-negative mean for Poisson
+        lam = _np.clip(img, 0, None)
+        img = rng.poisson(lam).astype(_np.float32)
+
+        # final cleanup: no negative values
+        _np.clip(img, 0.0, None, out=img)
+        return img
+
+    def gui_toggle_generic(self, state, attribute, plot_item):
+        setattr(self, attribute, state)
+        plot_item.setVisible(state)
+
+    def gui_toggle_ewald_labels(self, state):
+        self.show_ewald_labels = state
+        for txt in self.list_ewald_labels:
+            txt.setVisible(self.show_ewald_labels)
+        self.scan_add_labels(self.scan_data)
+    
+    def gui_toggle_detector_labels(self, state):
+        self.show_detector_labels = state
+        for txt in self.list_detector_labels:
+            txt.setVisible(self.show_detector_labels)
+        self.scan_add_labels(self.scan_data)
+
+    def gui_toggle_ewald_sphere(self, state):
+        self.show_ewald = state
+        self.ewald_sphere.setVisible(self.show_ewald)
+        self.ewald_outline_ab.setVisible(self.show_ewald)
+        self.ewald_outline_ac.setVisible(self.show_ewald)
+        self.ewald_outline_bc.setVisible(self.show_ewald)
+        self.ewald_ki.setVisible(self.show_ewald)
+        self.ewald_ko.setVisible(self.show_ewald)
+
+    def gui_toggle_detector(self, state):
+        self.show_detector = state
+        #self.plot_detector.setVisible(self.show_detector)
+        self.scat_pattern.setVisible(self.show_detector)
+        self.detector_plane.setVisible(self.show_detector)
+        self.detector_frame.setVisible(self.show_detector)
+
+    def gui_toggle_cell_axes(self, state):
+        if state == QtCore.Qt.CheckState.Unchecked or state == 0:
+            self.show_cell_axs = False
+            self.show_cell_axs_lbl = False
+        elif state == QtCore.Qt.CheckState.PartiallyChecked or state == 1:
+            self.show_cell_axs = True
+            self.show_cell_axs_lbl = False
+        else:
+            self.show_cell_axs = True
+            self.show_cell_axs_lbl = True
+        self.plot_ax_a.setVisible(self.show_cell_axs)
+        self.plot_ax_b.setVisible(self.show_cell_axs)
+        self.plot_ax_c.setVisible(self.show_cell_axs)
+        self.plot_ax_a_lbl.setVisible(self.show_cell_axs_lbl)
+        self.plot_ax_b_lbl.setVisible(self.show_cell_axs_lbl)
+        self.plot_ax_c_lbl.setVisible(self.show_cell_axs_lbl)
+    
+    def gui_toggle_goni_axes(self, state):
+        if state == QtCore.Qt.CheckState.Unchecked or state == 0:
+            self.show_gon_axs = False
+            self.show_gon_axs_lbl = False
+        elif state == QtCore.Qt.CheckState.PartiallyChecked or state == 1:
+            self.show_gon_axs = True
+            self.show_gon_axs_lbl = False
+        else:
+            self.show_gon_axs = True
+            self.show_gon_axs_lbl = True
+        self.plot_gon_phi.setVisible(self.show_gon_axs)
+        self.plot_gon_chi.setVisible(self.show_gon_axs)
+        self.plot_gon_omg.setVisible(self.show_gon_axs)
+        self.plot_gon_phi_lbl.setVisible(self.show_gon_axs_lbl)
+        self.plot_gon_chi_lbl.setVisible(self.show_gon_axs_lbl)
+        self.plot_gon_omg_lbl.setVisible(self.show_gon_axs_lbl)
+
+    def gui_set_projection(self, toggle):
+        self.orth_proj = toggle
+        if self.orth_proj:
+            #params = {'distance': 1000, 'fov': 1, 'elevation': 0, 'azimuth': 0, 'center': pg.Vector(0,0,0)}
+            distance = self.gl3d.cameraParams()['distance'] * 6800
+            params = {'distance': distance, 'fov': 0.01}
+        else:
+            #params = {'distance': 25, 'fov': 60, 'elevation': -15, 'azimuth': 0, 'center': pg.Vector(0,0,0)}
+            distance = self.gl3d.cameraParams()['distance'] / 6800
+            params = {'distance': distance, 'fov': 60}
+        self.gl3d.setCameraParams(**params)
+
+    def gui_set_scan_speed(self, value):
+        if self.scan_timer.isActive():
+            self.scan_timer.setInterval(value)
+
+    def gui_set_par_generic(self, parameter, value):
+        self.par[parameter] = value
+
+    def get_sym_ops(self):
+        # returns 2 matrices for '1' (?)
+        if self.par['sample_point_group'] == '1':
+            self.sym_mat = np.zeros((3,3), dtype=np.int8)
+        else:
+            self.sym_mat = np.vstack(get_sym_mat_from_coords(self.sym_dict[self.par['sample_point_group']])[1:]).reshape(-1, 3, 3).astype(np.int8)
+        #self.sym_mat = np.vstack(get_sym_mat_from_coords(self.sym_dict[self.par['sample_point_group']])[1:]).reshape(-1, 3, 3)
+        self.sym_mat_bases = self.sym_mat @ self.OM_UC.T * 1E-10
+
+    def get_orientation_matrix(self, OM=None):
+        # Make random orientation matrix
+        if hasattr(self, 'gui_sample_random_om'):
+            if self.gui_sample_random_om.isChecked():
+                self.OM = Quaternion.random(np.random)
+            elif OM == 'sacla':
+                self.OM = self.read_SACLA_OM()
+            else:
+                self.OM = Quaternion(w=1,x=0,y=0,z=0)
+        else:
+            if self.par['sample_random_om']:
+                self.OM = Quaternion.random(np.random)
+            else:
+                self.OM = Quaternion(w=1,x=0,y=0,z=0)
+
+    def read_SACLA_OM(self):
+        import h5py
+        my_path = '/Users/au577597/Library/CloudStorage/OneDrive-Aarhusuniversitet/Github/ReciprocalPlayground/SFX/'
+        with open(os.path.join(my_path, 'OM.txt'), 'r') as f:
+            taglist = f.readlines()
+        #tagdict = {i[0]: np.array(i[-9:]).astype(float).reshape((3,3)) for i in [j.split() for j in taglist]}
+        tagdict = {i[0]: np.array(i[-9:]).astype(float) for i in [j.split() for j in taglist]}
+        print(tagdict)
+        
+        UC = matrix_from_cell([self.par['sample_cell_a'],
+                               self.par['sample_cell_b'],
+                               self.par['sample_cell_c'],
+                               self.par['sample_cell_alpha'],
+                               self.par['sample_cell_beta'],
+                               self.par['sample_cell_gamma']])
+        print(UC)
+        _ = (tagdict['000000023'].reshape(-3,3) @ np.linalg.inv(UC))
+        print(_)
+        m00, m01, m02, m10, m11, m12, m20, m21, m22 = _.flatten()
+        if (m22 < 0):
+            if (m00 > m11):
+                t = 1 + m00 -m11 -m22
+                q = Quaternion( t, m01+m10, m20+m02, m12-m21 )
+            else:
+                t = 1 -m00 + m11 -m22
+                q = Quaternion( m01+m10, t, m12+m21, m20-m02 )
+        else:
+            if (m00 < -m11):
+                t = 1 -m00 -m11 + m22
+                q = Quaternion( m20+m02, m12+m21, t, m01-m10 )
+            else:
+                t = 1 + m00 + m11 + m22
+                q = Quaternion( m12-m21, m20-m02, m01-m10, t )
+        q *= 0.5 / np.sqrt(t)
+        print(q)
+
+        with h5py.File(os.path.join(my_path, '1334180_compact.h5'), 'r') as h5f:
+            img_tags = h5f['/entry/instrument/detector/tagnumbers'][()]
+            self.det_img_data = h5f['/entry/instrument/detector/detector_data'][0,:,:]
+        self.plot_add_detector()
+        return q
+
+    def restart_new_cell(self):
+        # Get initial orientation matrix
+        self.get_orientation_matrix()
+        # get new parameters from GUI
+        self.init_gui_parameters()
+        self.init_goniometer()
+        # clear plot
+        self.gl3d.clear()
+        # Reset scan progress
+        self.scan_data = pd.DataFrame(columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz'])
+        self.scan_symm = set()
+        # redraw plot
+        self.init_plot()
+        self.set_toggle_states()
+        # clear gui data table
+        self.gui_dat_tab.setRowCount(0)
+
+    def restart_check_enable(self):
+        if (self.par['sample_cell_a'] != self.gui_sample_a.value() or
+            self.par['sample_cell_b'] != self.gui_sample_b.value() or
+            self.par['sample_cell_c'] != self.gui_sample_c.value() or
+            self.par['sample_cell_alpha'] != self.gui_sample_alpha.value() or
+            self.par['sample_cell_beta'] != self.gui_sample_beta.value() or
+            self.par['sample_cell_gamma'] != self.gui_sample_gamma.value() or
+            self.par['wavelength'] != self.gui_sample_wavelength.value() * 1E-10 or
+            self.par['max_resolution'] != self.gui_prd_res.value() * 1E-10 or
+            self.par['sample_point_group'] != self.gui_sample_point_group.currentText()):
+            self.gui_sample_apply.setText('Apply Changes')
+        else:
+            self.gui_sample_apply.setText('Restart')
+
+    def scan_increment(self):
+        # This function calculates the measured hkls for the current goniometer angles
+        # First, check the length of the scattering vector -> unity, ewald offset
+        # Second, check the intersection point of diffracted beam vector and detector area
+        R = self.gon_rot_ax3.to_rotation_matrix()
+        
+        # This is heavy, we need to speed this up -> future problems
+        # - ideas: only calculate for remaining hkls, use KDTree for detector intersection
+        # - use some clever pre-calculation of scattering vectors? No idea how, if, yet.
+        # - use numba?
+        qs = (R @ self.hkl_bases.T).T #* 1E-10
+        kds = self.par['exp_incident_beam_vector'] + qs
+        
+        cond_ewald = abs(np.linalg.norm(kds, axis=1) - self.ewald_rad) <= self.par['ewald_offset']
+        c_hkls = self.hkls[cond_ewald]
+        c_bases = self.hkl_bases[cond_ewald]
+        c_qs = qs[cond_ewald]
+        c_kds = kds[cond_ewald]
+
+        TTH = self.gon_rot_tth.inverse().to_rotation_matrix()
+        c_kds = (TTH @ c_kds.T).T
+        # real space length scale, in [m]
+        rsl = self.par['det_distance'] * 1E10 / c_kds[:,2]
+        # real space scattering vectors
+        rsvs = c_kds * rsl[:,None]
+        # x, y projection, relative to beam center, in pixel
+        pxs = (rsvs[:,0] * 1E-10 + self.par['det_poni_1']) / self.par['det_pix_s']
+        pys = (rsvs[:,1] * 1E-10 + self.par['det_poni_2']) / self.par['det_pix_s']
+        c_xys = np.vstack([pys, pxs]).T
+        cond_visible = np.where((c_xys[:,0] > 0)&
+                                (c_xys[:,1] > 0)&
+                                (c_xys[:,0] < self.par['det_pix_2'])&
+                                (c_xys[:,1] < self.par['det_pix_1'])&
+                                (c_kds[:,2] > 0))
+
+        v_qs = c_qs[cond_visible]
+        v_det = np.zeros((0,3), dtype=float)
+
+        if len(v_qs) == 0:
+            self.plot_diff_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
+            self.plot_scat_vecs.setData(edges=np.zeros((0,2), dtype=int), nodePositions=np.zeros((0,3)))
+        else:
+            # calculate detector intersection points and partiality correction
+            v_l0 = np.array([0, 0, -self.ewald_rad])
+            v_kds = v_qs - v_l0
+            # v_p0 not equal to -v_n after detector correction (roll, pitch, yaw)
+            v_p0 = np.array([0, 0, self.plot_det_dist]) @ TTH
+            v_n = np.array([0, 0, -self.plot_det_dist]) @ TTH
+            v_scale = ((v_p0 - v_l0) @ v_n) / (v_kds @ v_n)
+            v_det = v_kds * v_scale[:, None] + v_l0
+            v_pac = correction_partiality_geometric(v_kds, self.ewald_rad, self.par['sfx_spectral_width'], self.par['sfx_rlp_size'])
+            v_poc = PolCorFromkfs(kf=v_kds, pol_deg=self.par['polarization'])
+            v_tth = calc_angles(v_kds, np.array([[0,0,1]]))
+            # plot scattering and diffracted beam vectors
+            edges = np.vstack([np.zeros(len(v_det), dtype=int), np.arange(1, len(v_det)+1, 1)]).T
+            nodes = np.vstack([np.array([0, 0, -self.ewald_rad]), v_det])
+            self.plot_diff_vecs.setData(edges=edges, nodePositions=nodes)
+            if self.show_scat_vecs:
+                edges = np.vstack([np.zeros(len(v_qs), dtype=int), np.arange(1, len(v_qs)+1, 1)]).T
+                nodes = np.vstack([np.array([0, 0, 0]), v_qs])
+                self.plot_scat_vecs.setData(edges=edges, nodePositions=nodes)
+            return pd.DataFrame(np.hstack([c_hkls[cond_visible], c_bases[cond_visible], v_det, v_tth, v_poc, v_pac]), columns=['h', 'k', 'l', 'bx', 'by', 'bz', 'dx', 'dy', 'dz', 'tth', 'poc', 'pac'])
+
+    def scan_update(self):
+        # Update the gui to rotate the scene objects (goniometer)
+        # value update calls the rotate_gon() function
+        self.scan_progress += self.gui_scan_step.value()
+        self.scan_progress = round(self.scan_progress, 6)
+        
+        # update goniometer angles
+        if self.gui_scan_axis.currentText() == 'Phi':
+            self.par['gon_phi_ang'] += self.gui_scan_step.value()
+            self.gui_gon_phi.setValue(self.par['gon_phi_ang'])
+        elif self.gui_scan_axis.currentText() == 'Omega':
+            self.par['gon_omg_ang'] += self.gui_scan_step.value()
+            self.gui_gon_omg.setValue(self.par['gon_omg_ang'])
+        elif self.gui_scan_axis.currentText() == 'SFX':
+            self.par['gon_phi_ang'] = np.rad2deg(np.random.rand() * 2 * np.pi)
+            self.gui_gon_phi.setValue(self.par['gon_phi_ang'])
+            self.par['gon_chi_ang'] = np.rad2deg(np.random.rand() * 2 * np.pi)
+            self.gui_gon_chi.setValue(self.par['gon_chi_ang'])
+            self.par['gon_omg_ang'] = np.rad2deg(np.random.rand() * 2 * np.pi)
+            self.gui_gon_omg.setValue(self.par['gon_omg_ang'])
+        
+        # scan and get new data
+        _scan_data = self.scan_increment()
+
+        # append/display new data
+        if _scan_data is not None and len(_scan_data) > 0:
+            self.scan_data = self.scan_data.merge(_scan_data, how='outer')
+            if not self.sfx_keep_all_data:
+                self.scan_data.drop_duplicates(subset=['h','k','l'], keep='last', inplace=True)
+            self.scan_data.reset_index(drop=True, inplace=True)
+            # plot the current scan data
+            self.scat_scan.setData(pos=_scan_data[['bx', 'by', 'bz']])
+            # plot the collected data
+            self.scat_data.setData(pos=self.scan_data[['bx', 'by', 'bz']])
+            # plot the diffraction pattern on the detector
+            self.scat_pattern.setData(pos=self.scan_data[['dx', 'dy', 'dz']])
+            # calculate symmetry equivalents
+            # set of collected data
+            # we need to round the floats to avoid precision issues, 10 digits should be enough
+            _set_symm_collected = set(map(tuple, np.round(self.scan_data[['bx', 'by', 'bz']].to_numpy(), 10)))
+            # set of all symmetry equivalents of current scan
+            _set_symm_equivalent = set(map(tuple, (np.round(_scan_data[['h','k','l']].to_numpy() @ self.sym_mat_bases, 10).reshape(-1,3))))
+            # add new symmetry equivalents to collected set
+            # subtract already collected data
+            self.scan_symm = (self.scan_symm | _set_symm_equivalent) - _set_symm_collected
+            self.scat_symm.setData(pos=list(self.scan_symm))
+
+            # hkl text labels
+            self.scan_add_labels(_scan_data)
+
+        # update progress display
+        self.gui_scan_total.setText(f'{self.hkls_num}')
+        self.gui_scan_completeness.setText(f'{len(self.scan_data)/self.hkls_num*100:.0f} % ({(len(self.scan_symm)+len(self.scan_data))/self.hkls_num*100:.0f} %)')
+        self.gui_scan_collected.setText(f'{len(self.scan_data)} ({len(self.scan_symm)+len(self.scan_data)})')
+
+        # check scan progress
+        if self.scan_progress >= self.gui_scan_range.value():
+            self.scan_finished()
+
+    def scan_add_labels(self, data:pd.DataFrame):
+        # Clear all labels
+        for i in range(self.par['plot_max_hkl_labels']):
+            self.list_ewald_labels[i].setData(text='')
+            self.list_detector_labels[i].setData(text='')
+        
+        # hkl text labels
+        if len(data) > 0:
+            for i, row in data.iterrows():
+                #self.list_ewald_labels[i].setData(text='')
+                #self.list_detector_labels[i].setData(text='')
+                if i >= self.par['plot_max_hkl_labels']:
+                    break
+                base = row[['bx', 'by', 'bz']].to_numpy()
+                xyz = row[['dx', 'dy', 'dz']].to_numpy()
+                h, k, l = row[['h', 'k', 'l']].to_numpy(dtype=int)
+                poc = row['poc']
+                pac = row['pac']
+                tth = np.rad2deg(row['tth'])
+                if self.gui_show_detector_labels.checkState() == QtCore.Qt.CheckState.PartiallyChecked:
+                    self.list_detector_labels[i].setData(pos=xyz, text=f'{h} {k} {l}')
+                elif self.gui_show_detector_labels.checkState() == QtCore.Qt.CheckState.Checked:
+                    self.list_detector_labels[i].setData(pos=xyz, text=f'{h} {k} {l}\n\u03b8 {tth:.4f}\n\u29b9 {poc:.4f}\n\u2202 {pac:.4f}')
+                else:
+                    self.list_detector_labels[i].hide()
+                if self.gui_show_hkls.checkState() == QtCore.Qt.CheckState.PartiallyChecked:
+                    self.list_ewald_labels[i].setData(pos=base, text=f'{h} {k} {l}')
+                elif self.gui_show_hkls.checkState() == QtCore.Qt.CheckState.Checked:
+                    self.list_ewald_labels[i].setData(pos=base, text=f'{h} {k} {l}\n\u03b8 {tth:.4f}\n\u29b9 {poc:.4f}\n\u2202 {pac:.4f}')
+                else:
+                    self.list_ewald_labels[i].hide()
+
+    def scan_finished(self):
+        self.scan_progress = 0
+        self.scan_timer.stop()
+        self.gui_start_scan.setText('Start Scan')
+        self.gui_start_scan.setStyleSheet("background-color: #006A67")
+
+        # sort data by h, k, l
+        #self.scan_data = self.scan_data.sort_values(['h','k','l'], key=abs)
+        # calculate d-spacings
+        self.scan_data['d'] = 1 / np.linalg.norm(self.scan_data[['h','k','l']] @ self.OM_UC.T, axis=1) * 1E10
+        # Add data to table
+        self.gui_dat_tab.setRowCount(len(self.scan_data))
+        # reset column count
+        self.gui_dat_tab.setColumnCount(6)
+        # sorting while poplating causes issues
+        self.gui_dat_tab.setSortingEnabled(False)
+        # fill table, all data
+        for (i, row) in self.scan_data.sort_values(['h','k','l'], key=abs).iterrows():
+            # bug here filling the table after sorting
+            self.gui_dat_tab.setItem(i, 0, QtWidgets.QTableWidgetItem(str(int(row['h']))))
+            self.gui_dat_tab.setItem(i, 1, QtWidgets.QTableWidgetItem(str(int(row['k']))))
+            self.gui_dat_tab.setItem(i, 2, QtWidgets.QTableWidgetItem(str(int(row['l']))))
+            self.gui_dat_tab.setItem(i, 3, QtWidgets.QTableWidgetItem(f'{row['d']:.2f}'))
+            self.gui_dat_tab.setItem(i, 4, QtWidgets.QTableWidgetItem(f'{row['poc']:.4f}'))
+            self.gui_dat_tab.setItem(i, 5, QtWidgets.QTableWidgetItem(f'{row['pac']:.4f}'))
+            self.gui_dat_tab.item(i, 0).setData(QtCore.Qt.ItemDataRole.UserRole, int(i))
+        # enable sorting again
+        self.gui_dat_tab.setSortingEnabled(True)
+        
+        # Signal GUI that scan is finished
+        self.sigScanFinished.emit()
+
+    def scan_toggle(self):
+        if not self.scan_timer.isActive():
+            self.gui_start_scan.setText('Pause Scan')
+            self.gui_start_scan.setStyleSheet("background-color: #A02334")
+            self.scan_timer.setInterval(self.gui_scan_speed.value())
+            self.scan_timer.start()
+        else:
+            self.gui_start_scan.setText('Continue Scan')
+            self.gui_start_scan.setStyleSheet("background-color: #006A67")
+            self.scan_timer.stop()
+
+    def strat_toggle(self):
+        if self.scan_timer.isActive():
+            return
+        for row in range(self.gui_strat_tab.rowCount()):
+            self.gui_gon_omg.setValue(float(self.gui_strat_tab.item(row, 0).text()))
+            self.gui_gon_chi.setValue(float(self.gui_strat_tab.item(row, 1).text()))
+            self.gui_gon_phi.setValue(float(self.gui_strat_tab.item(row, 2).text()))
+            self.gui_scan_step.setValue(float(self.gui_strat_tab.item(row, 3).text()))
+            self.gui_scan_range.setValue(int(self.gui_strat_tab.item(row, 4).text()))
+            self.gui_strat_tab.selectRow(row)
+            self.scan_toggle()
+            loop = QtCore.QEventLoop()
+            self.sigScanFinished.connect(loop.exit)
+            loop.exec()
+
+    def look_along(self, vec):
+        # Helper to set camera to look along a given axis vector
+        v = np.array(vec, dtype=float)
+        norm_v = np.linalg.norm(v)
+        if norm_v == 0:
+            return
+        # elevation: angle above the XY-plane
+        elevation = np.rad2deg(np.arctan2(v[2], np.sqrt(v[0]**2 + v[1]**2)))
+        # azimuth: angle in the XY-plane from +X
+        azimuth = np.rad2deg(np.arctan2(v[1], v[0]))
+        params = self.gl3d.cameraParams()
+        distance = params.get('distance', None)
+        if distance is None:
+            self.gl3d.setCameraPosition(elevation=elevation, azimuth=azimuth)
+        elif self.gl3d.centered:
+            self.gl3d.setCameraPosition(distance=distance, elevation=elevation, azimuth=azimuth)
+        else:
+            self.gl3d.setCameraPosition(QtGui.QVector3D(0, 0, 0), distance=distance, elevation=elevation, azimuth=azimuth)
+            self.gl3d.centered = False
+            #self.gl3d.setCameraPosition(distance=distance, elevation=elevation, azimuth=azimuth)
+
+    def keyPressEvent(self, ev):
+        # Compute the cell axes (in meters) and apply current goniometer rotation (phi, chi, omega)
+        if ev.key() == QtCore.Qt.Key.Key_F1:
+            # look down rotated a axis
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.OM_UC * 1E-10)[:, 0])
+            self.look_along_option *= -1
+        elif ev.key() == QtCore.Qt.Key.Key_F2:
+            # look down rotated b axis
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.OM_UC * 1E-10)[:, 1])
+            self.look_along_option *= -1
+        elif ev.key() == QtCore.Qt.Key.Key_F3:
+            # look down rotated c axis
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.OM_UC * 1E-10)[:, 2])
+            self.look_along_option *= -1
+        elif ev.key() == QtCore.Qt.Key.Key_F4:
+            # look down current omega goniometer axis (apply combined gon rotation)
+            self.look_along(self.gon_rot_ax1.to_rotation_matrix() @ (self.look_along_option * self.par['gon_omg_axs']))
+            self.look_along_option *= -1
+        elif ev.key() == QtCore.Qt.Key.Key_F5:
+            # look down current chi axis
+            self.look_along(self.gon_rot_ax2.to_rotation_matrix() @ (self.look_along_option * self.par['gon_chi_axs']))
+            self.look_along_option *= -1
+        elif ev.key() == QtCore.Qt.Key.Key_F6:
+            # look down current phi axis
+            self.look_along(self.gon_rot_ax3.to_rotation_matrix() @ (self.look_along_option * self.par['gon_phi_axs']))
+            self.look_along_option *= -1
+        elif ev.key() == QtCore.Qt.Key.Key_C:
+            self.gl3d.cameraParams()
+        elif ev.key() == QtCore.Qt.Key.Key_S:
+            if self.scan_timer.isActive():
+                self.scan_timer.stop()
+            else:
+                self.scan_toggle()
+
+    def rotate_gon(self):
+        # Apply goniometer rotation changes from GUI to all relevant items in the 3D scene
+        # calculate new goniometer rotation
+        gon_rot_ax3_new = Quaternion.from_axis_rotation(self.par['gon_phi_axs'], np.deg2rad(self.gui_gon_phi.value())) * \
+                          Quaternion.from_axis_rotation(self.par['gon_chi_axs'], np.deg2rad(self.gui_gon_chi.value())) * \
+                          Quaternion.from_axis_rotation(self.par['gon_omg_axs'], np.deg2rad(self.gui_gon_omg.value()))
+        gon_rot_ax2_new = Quaternion.from_axis_rotation(self.par['gon_chi_axs'], np.deg2rad(self.gui_gon_chi.value())) * \
+                          Quaternion.from_axis_rotation(self.par['gon_omg_axs'], np.deg2rad(self.gui_gon_omg.value()))
+        gon_rot_ax1_new = Quaternion.from_axis_rotation(self.par['gon_omg_axs'], np.deg2rad(self.gui_gon_omg.value()))
+
+        # calculate rotation delta
+        gon_rot_ax3_delta = self.gon_rot_ax3.inverse() * gon_rot_ax3_new
+        gon_rot_ax2_delta = self.gon_rot_ax2.inverse() * gon_rot_ax2_new
+        gon_rot_ax1_delta = self.gon_rot_ax1.inverse() * gon_rot_ax1_new
+
+        # update stored goniometer rotation
+        self.gon_rot_ax3 = gon_rot_ax3_new
+        self.gon_rot_ax2 = gon_rot_ax2_new
+        self.gon_rot_ax1 = gon_rot_ax1_new
+
+        # calculate combined rotation
+        ax3, ang3 = gon_rot_ax3_delta.get_axis_angle()
+        ax2, ang2 = gon_rot_ax2_delta.get_axis_angle()
+        ax1, ang1 = gon_rot_ax1_delta.get_axis_angle()
+
+        # convert to degrees
+        ang3 = np.rad2deg(ang3)
+        ang2 = np.rad2deg(ang2)
+        ang1 = np.rad2deg(ang1)
+
+        # apply combined rotation delta to all relevant items
+        self.scat_latt.rotate(ang3, *ax3)
+        self.scat_scan.rotate(ang3, *ax3)
+        self.scat_data.rotate(ang3, *ax3)
+        self.scat_symm.rotate(ang3, *ax3)
+        for lbl in self.list_ewald_labels:
+            lbl.rotate(ang3, *ax3)
+        self.plot_ax_a.rotate(ang3, *ax3)
+        self.plot_ax_b.rotate(ang3, *ax3)
+        self.plot_ax_c.rotate(ang3, *ax3)
+        self.plot_cell.rotate(ang3, *ax3)
+
+        # rotate goniometer axes
+        self.plot_gon_phi.rotate(ang3, *ax3)
+        self.plot_gon_chi.rotate(ang2, *ax2)
+        self.plot_gon_omg.rotate(ang1, *ax1)
+
+        # Rotate crystal about the goniometer axes but keep it centered at the Ewald center.
+        # We translate the mesh to the global goniometer origin, rotate, then translate back.
+        self.crystal_mesh.translate(0.0, 0.0, self.ewald_rad)
+        self.crystal_mesh.rotate(ang3, *ax3)
+        self.crystal_mesh.translate(0.0, 0.0, -self.ewald_rad)
+
+    def rotate_gon_tth(self, relative=True):
+        # Apply 2theta rotation changes from GUI to all relevant items in the 3D scene
+        # calculate new 2theta rotation
+        if self.gui_gon_tth_orientation.currentText() == 'Vertical':
+            gon_rot_new = Quaternion.from_axis_rotation(self.par['gon_ttv_axs'], np.deg2rad(self.gui_gon_tth.value()))
+        elif self.gui_gon_tth_orientation.currentText() == 'Horizontal':
+            gon_rot_new = Quaternion.from_axis_rotation(self.par['gon_tth_axs'], np.deg2rad(self.gui_gon_tth.value()))
+        else:
+            pass
+        
+        if relative:
+            gon_rot_delta = self.gon_rot_tth.inverse() * gon_rot_new
+            self.gon_rot_tth = gon_rot_new
+            axs, ang = gon_rot_delta.get_axis_angle()
+            ang = np.rad2deg(ang)
+        else:
+            self.gon_rot_tth = gon_rot_new
+            axs, ang = gon_rot_new.get_axis_angle()
+            ang = np.rad2deg(ang)
+
+        # Rotate the detector plot
+        if hasattr(self, 'plot_detector'):
+          self.plot_detector.rotate(ang, *axs)
+        # Rotate the mesh detector and the frame so they stay aligned
+        if hasattr(self, 'detector_plane'):
+            self.detector_plane.rotate(ang, *axs)
+        if hasattr(self, 'detector_frame'):
+            self.detector_frame.rotate(ang, *axs)
