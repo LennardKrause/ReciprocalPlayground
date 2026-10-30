@@ -8,7 +8,7 @@
 >[!NOTE]
 >Check the [releases page](https://github.com/LennardKrause/ReciprocalPlayground/releases), download the latest *.whl and install it using pip.<br>
 >```python3 -m pip install reciprocalplayground-1.0.0-py3-none-any.whl```<br>
->Run it by typing ```ReciprocalPlayground``` in a terminal
+>Run it by typing ```ReciprocalPlayground``` in a terminal (or ```rcppg```)
 
 ## Version 1.0.0 (28.10.2026)
  - First release candidate
